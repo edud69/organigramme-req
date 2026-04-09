@@ -44,6 +44,10 @@ PERSON_NODE = "person"
 app = Flask(__name__)
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("organigramme-req")
+HTTP_USER_AGENT = os.environ.get(
+    "HTTP_USER_AGENT",
+    "Mozilla/5.0 (compatible; OrganigrammeREQ/1.0; +https://github.com/edud69/organigramme-req)",
+)
 data_lock = threading.Lock()
 sync_state = {
     "is_running": False,
@@ -185,7 +189,8 @@ def normalize_node_id(entity_type: str, raw_value: str) -> str:
 
 def fetch_json(url: str, timeout: int = 30) -> Optional[dict]:
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        req = urllib.request.Request(url, headers={"User-Agent": HTTP_USER_AGENT})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception:
         return None
@@ -223,7 +228,20 @@ def parse_remote_date(date_str: str) -> Optional[dt.datetime]:
 def download_file(url: str, dest: Path) -> bool:
     tmp_path = dest.with_suffix(dest.suffix + ".tmp")
     try:
-        with urllib.request.urlopen(url, timeout=SYNC_TIMEOUT_SECONDS) as response, tmp_path.open("wb") as out:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": HTTP_USER_AGENT,
+                "Accept": "*/*",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=SYNC_TIMEOUT_SECONDS) as response, tmp_path.open("wb") as out:
+            logger.info(
+                "REQ download response status=%s content_type=%s final_url=%s",
+                getattr(response, "status", "unknown"),
+                response.headers.get("Content-Type"),
+                response.geturl(),
+            )
             while True:
                 chunk = response.read(8192)
                 if not chunk:
@@ -232,6 +250,7 @@ def download_file(url: str, dest: Path) -> bool:
         os.replace(tmp_path, dest)
         return True
     except Exception:
+        logger.exception("REQ download failed for %s", url)
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
         return False
