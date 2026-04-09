@@ -1,0 +1,17 @@
+name: Nightly Sync
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger deployed sync
+        run: |
+          curl --fail --show-error --silent \
+            -X POST \
+            -H "X-Admin-Sync-Token: ${{ secrets.SYNC_TOKEN }}" \
+            "${{ secrets.SYNC_URL }}?force=1"
