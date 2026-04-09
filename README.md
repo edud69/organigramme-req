@@ -62,14 +62,12 @@ Le repo inclut :
 
 - un `Procfile` pour lancer `gunicorn`
 - un `render.yaml` pour préparer un déploiement Render
-- un workflow GitHub Actions nocturne qui peut frapper `/api/sync` si les secrets sont configurés
 
 ## Workflow conseillé
 
 1. Déployer l'app web.
 2. Définir `ADMIN_SYNC_TOKEN` sur l'hébergeur.
 3. Si Données Québec bloque l’API CKAN côté serveur, définir aussi `REQ_DATASET_ZIP_URL`.
-4. Configurer les secrets GitHub `SYNC_URL` et `SYNC_TOKEN`.
-5. Laisser GitHub Actions déclencher le sync chaque nuit.
+4. Mettre en place un cron côté hébergeur ou laisser l’auto-sync interne tourner toutes les 24 heures.
 
 Cette approche est robuste pour le refresh du dataset ouvert. Pour les personnes physiques, il faudra décider de la source d’enrichissement avant de promettre un graphe complet entreprise/personne à l’échelle du Québec.
