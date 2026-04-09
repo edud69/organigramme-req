@@ -1,25 +1,75 @@
-# Organigramme des entreprises du Québec
+# Organigramme REQ Québec
 
-Cette application Flask permet de visualiser les relations d'entreprises du Registre des entreprises du Québec (REQ) sous la forme d'un organigramme interactif. Elle charge les fichiers `Nom.csv` et `FusionScission.csv` du jeu de données du REQ, extrait les noms des entreprises et construit un graphe des relations de fusion/scission entre NEQ.
+Application Flask pour rechercher les entreprises du Québec et visualiser leurs relations sous forme de graphe interactif à partir du jeu de données ouvert du Registre des entreprises du Québec (REQ).
 
-## Mise à jour des données
+## Ce que le projet fait maintenant
 
-Le script `update_dataset` télécharge automatiquement la dernière version du registre via l'API CKAN de Données Québec et planifie une vérification toutes les 24 heures. Les fichiers CSV sont extraits et rechargés sans redémarrage.
+- Télécharge automatiquement la dernière archive ZIP du REQ depuis Données Québec.
+- Indexe les CSV dans une base SQLite locale pour rendre la recherche rapide.
+- Affiche un graphe visuel des relations directes entre entités juridiques trouvées dans les fichiers REQ.
+- Expose un endpoint de sync manuel `POST /api/sync`.
+- Lance un sync automatique toutes les 24 heures tant que le service reste actif.
 
-> **Licence** : Les données du Registre des entreprises sont publiques et anonymisées (les noms et adresses des personnes physiques ne figurent pas dans les fichiers), et sont diffusées sous licence CC BY‑NC‑SA 4.0【122191560308607†L150-L156】【122191560308607†L176-L183】. Elles sont mises à jour deux fois par mois【122191560308607†L160-L170】.
+## Limite importante sur les personnes physiques
 
-## Déploiement
+Le jeu de données ouvert du REQ anonymise les personnes physiques et les personnes liées. La page officielle du dataset précise que :
 
-Pour déployer l'application sur une plateforme d'hébergement, installez les dépendances avec :
+- les noms, prénoms et adresses des personnes physiques sont absents;
+- les noms, prénoms et adresses des personnes liées comme les administrateurs sont absents.
 
-```【】bash
+Conséquence : l’application prépare déjà le modèle de données pour relier des personnes physiques aux compagnies, mais ces nœuds ne peuvent pas être remplis à grande échelle à partir du seul dataset ouvert. Pour afficher actionnaires, administrateurs et bénéficiaires ultimes, il faut une source complémentaire autorisée.
+
+## Lancer le projet
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-puis lancez le serveur Flask :
-
-```【】bash
 python app.py
 ```
 
-L'application écoute par défaut sur le port 5000.
+Application disponible sur `http://localhost:5000`.
+
+## Forcer une synchronisation
+
+```bash
+python app.py sync
+```
+
+Ou via HTTP :
+
+```bash
+curl -X POST http://localhost:5000/api/sync
+```
+
+Si `ADMIN_SYNC_TOKEN` est défini, ajoute l'en-tête `X-Admin-Sync-Token`.
+
+## Variables d'environnement
+
+- `PORT` : port HTTP, par défaut `5000`
+- `FLASK_DEBUG` : `1` pour activer le mode debug
+- `AUTO_SYNC_ENABLED` : `1` ou `0`
+- `UPDATE_INTERVAL_SECONDS` : fréquence du sync, par défaut `86400`
+- `MAX_SEARCH_RESULTS` : taille de la liste de résultats, par défaut `20`
+- `MAX_GRAPH_EDGES` : limite de liens par vue graphe, par défaut `250`
+- `ADMIN_SYNC_TOKEN` : jeton simple pour protéger `POST /api/sync`
+- `REQ_CKAN_PACKAGE_URL` : surcharge de l'URL CKAN si nécessaire
+- `REQ_DATASET_ZIP_URL` : URL ZIP directe à utiliser si l'API CKAN renvoie `403`
+
+## Déploiement
+
+Le repo inclut :
+
+- un `Procfile` pour lancer `gunicorn`
+- un `render.yaml` pour préparer un déploiement Render
+- un workflow GitHub Actions nocturne qui peut frapper `/api/sync` si les secrets sont configurés
+
+## Workflow conseillé
+
+1. Déployer l'app web.
+2. Définir `ADMIN_SYNC_TOKEN` sur l'hébergeur.
+3. Si Données Québec bloque l’API CKAN côté serveur, définir aussi `REQ_DATASET_ZIP_URL`.
+4. Configurer les secrets GitHub `SYNC_URL` et `SYNC_TOKEN`.
+5. Laisser GitHub Actions déclencher le sync chaque nuit.
+
+Cette approche est robuste pour le refresh du dataset ouvert. Pour les personnes physiques, il faudra décider de la source d’enrichissement avant de promettre un graphe complet entreprise/personne à l’échelle du Québec.

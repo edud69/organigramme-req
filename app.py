@@ -1,335 +1,717 @@
-import datetime
-import os
-import threading
-import zipfile
-from functools import lru_cache
-from typing import Dict, List, Optional
-
-"""
-Application Flask pour visualiser les relations entre entités inscrites au
-registre des entreprises du Québec (REQ). Cette version ne dépend pas de
-bibliothèques externes comme pandas ou networkx afin de faciliter son
-déploiement sur des plateformes disposant de ressources limitées.
-
-Le jeu de données du REQ est distribué sous forme d'une archive ZIP qui
-contient plusieurs fichiers CSV. Seuls deux fichiers sont utilisés ici :
-  - ``Nom.csv`` : liste des noms et numéros d'entreprise (NEQ) ;
-  - ``FusionScission.csv`` : relations entre entreprises (NEQ) impliquées
-    dans des fusions ou scissions.
-
-Le code télécharge automatiquement l'archive si une nouvelle version est
-publiée, puis charge les fichiers nécessaires en mémoire à l'aide du module
-CSV de la bibliothèque standard.
-
-Cela permet d'exécuter l'application sur des environnements où il est
-impossible d'installer des paquets supplémentaires.
-"""
-
 import csv
-from flask import Flask, jsonify, render_template, request
+import datetime as dt
+import hashlib
+import io
 import json
+import os
+import sqlite3
+import threading
+import time
 import urllib.request
+import zipfile
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+
+from flask import Flask, jsonify, render_template, request
+
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+DATA_ZIP_PATH = DATA_DIR / "req-dataset.zip"
+DB_PATH = DATA_DIR / "req_cache.sqlite3"
+
+CKAN_PACKAGE_URL = os.environ.get(
+    "REQ_CKAN_PACKAGE_URL",
+    "https://www.donneesquebec.ca/recherche/api/3/action/package_show"
+    "?id=6f710997-b5f9-4347-893b-1a47ddb61437",
+)
+REQ_DATASET_ZIP_URL = os.environ.get("REQ_DATASET_ZIP_URL", "").strip()
+UPDATE_INTERVAL_SECONDS = int(os.environ.get("UPDATE_INTERVAL_SECONDS", str(24 * 3600)))
+AUTO_SYNC_ENABLED = os.environ.get("AUTO_SYNC_ENABLED", "1") == "1"
+MAX_SEARCH_RESULTS = int(os.environ.get("MAX_SEARCH_RESULTS", "20"))
+MAX_GRAPH_EDGES = int(os.environ.get("MAX_GRAPH_EDGES", "250"))
+SYNC_TIMEOUT_SECONDS = int(os.environ.get("SYNC_TIMEOUT_SECONDS", "120"))
+ADMIN_SYNC_TOKEN = os.environ.get("ADMIN_SYNC_TOKEN", "")
+
+COMPANY_NODE = "company"
+PERSON_NODE = "person"
 
 app = Flask(__name__)
-
-# Chemin vers l'archive ZIP contenant les données du registre. Elle sera
-# automatiquement téléchargée et mise à jour depuis le portail Données Québec.
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-DATA_ZIP_PATH = os.path.join(DATA_DIR, "req-dataset.zip")
-
-# URL de l'API CKAN utilisée pour récupérer les métadonnées du jeu de données.
-# Voir https://docs.ckan.org/en/latest/api/index.html#ckan.logic.action.get.package_show
-CKAN_PACKAGE_URL = (
-    "https://www.donneesquebec.ca/recherche/api/3/action/package_show"
-    "?id=6f710997-b5f9-4347-893b-1a47ddb61437"
-)
-
-# Intervalle entre deux vérifications des mises à jour (en secondes).
-UPDATE_INTERVAL = 24 * 3600  # 24 heures
-
-# Verrou pour protéger l'accès concurrentiel au fichier de données lors de la
-# mise à jour. Sans cela, une requête API pourrait tenter de lire des données
-# pendant qu'elles sont en cours de téléchargement.
 data_lock = threading.Lock()
+sync_state = {
+    "is_running": False,
+    "last_started_at": None,
+    "last_completed_at": None,
+    "last_success_at": None,
+    "last_error": None,
+}
 
 
 def ensure_data_dir() -> None:
-    """Crée le dossier des données s'il n'existe pas."""
-    os.makedirs(DATA_DIR, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def utc_now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def local_now_iso() -> str:
+    return dt.datetime.now().astimezone().isoformat()
+
+
+def open_db() -> sqlite3.Connection:
+    ensure_data_dir()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def init_db() -> None:
+    with open_db() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS entities (
+                node_id TEXT PRIMARY KEY,
+                entity_type TEXT NOT NULL,
+                label TEXT NOT NULL,
+                normalized_label TEXT NOT NULL,
+                neq TEXT,
+                source TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS entity_aliases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                node_id TEXT NOT NULL,
+                alias TEXT NOT NULL,
+                normalized_alias TEXT NOT NULL,
+                source TEXT NOT NULL,
+                UNIQUE(node_id, normalized_alias)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_entity_aliases_normalized
+            ON entity_aliases(normalized_alias);
+
+            CREATE TABLE IF NOT EXISTS relations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_node_id TEXT NOT NULL,
+                target_node_id TEXT NOT NULL,
+                relation_type TEXT NOT NULL,
+                relation_label TEXT NOT NULL,
+                source_dataset TEXT NOT NULL,
+                source_detail TEXT,
+                updated_at TEXT NOT NULL,
+                UNIQUE(source_node_id, target_node_id, relation_type, source_dataset, source_detail)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_relations_source
+            ON relations(source_node_id);
+
+            CREATE INDEX IF NOT EXISTS idx_relations_target
+            ON relations(target_node_id);
+            """
+        )
+
+
+def normalize_text(value: str) -> str:
+    return " ".join((value or "").strip().lower().split())
+
+
+def normalize_node_id(entity_type: str, raw_value: str) -> str:
+    if entity_type == COMPANY_NODE and raw_value:
+        return f"company:{raw_value.strip()}"
+    digest = hashlib.sha1(normalize_text(raw_value).encode("utf-8")).hexdigest()[:16]
+    return f"{entity_type}:{digest}"
+
+
+def fetch_json(url: str, timeout: int = 30) -> Optional[dict]:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
 
 
 def fetch_metadata() -> Optional[dict]:
-    """Récupère les métadonnées du jeu de données via l'API CKAN.
-
-    Returns:
-        Un dictionnaire représentant la clé ``result`` de la réponse JSON, ou
-        ``None`` en cas d'erreur.
-    """
-    try:
-        with urllib.request.urlopen(CKAN_PACKAGE_URL, timeout=30) as resp:
-            # Le corps renvoyé est une chaîne JSON. On le charge via json.loads.
-            body = resp.read().decode("utf-8")
-            data = json.loads(body)
-            if data.get("success"):
-                return data.get("result")
-    except Exception:
-        # La récupération a échoué (problème réseau, 403, etc.)
-        return None
+    payload = fetch_json(CKAN_PACKAGE_URL)
+    if payload and payload.get("success"):
+        return payload.get("result")
     return None
 
 
 def find_zip_resource(metadata: dict) -> Optional[dict]:
-    """Identifie la ressource ZIP dans la liste des ressources du jeu de données.
-
-    Args:
-        metadata: Dictionnaire ``result`` renvoyé par l'API CKAN.
-
-    Returns:
-        Le dictionnaire de la ressource ZIP si trouvé, ``None`` sinon.
-    """
-    resources = metadata.get("resources", []) if metadata else []
-    for res in resources:
-        # On recherche une ressource dont l'URL se termine par .zip ou dont le
-        # format déclaré est ZIP. Certaines ressources peuvent être renommées,
-        # donc on vérifie également le nom.
-        url = res.get("url", "").lower()
-        name = res.get("name", "").lower()
-        format_field = res.get("format", "").lower()
-        if ".zip" in url or ".zip" in name or format_field == "zip":
+    for res in metadata.get("resources", []):
+        url = (res.get("url") or "").lower()
+        name = (res.get("name") or "").lower()
+        format_name = (res.get("format") or "").lower()
+        if ".zip" in url or ".zip" in name or format_name == "zip":
             return res
     return None
 
 
-def parse_remote_date(date_str: str) -> Optional[datetime.datetime]:
-    """Convertit une chaîne ISO 8601 en objet datetime.
-
-    Args:
-        date_str: Chaîne au format ``YYYY-MM-DDTHH:MM:SS(.ffffffff)``.
-
-    Returns:
-        Un ``datetime`` ou ``None`` si la chaîne est invalide.
-    """
+def parse_remote_date(date_str: str) -> Optional[dt.datetime]:
     if not date_str:
         return None
     try:
-        # Certains champs ``last_modified`` contiennent des fractions de
-        # secondes. On les prend en compte si présents.
-        return datetime.datetime.fromisoformat(date_str.rstrip("Z"))
+        parsed = dt.datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.astimezone(dt.timezone.utc)
     except ValueError:
         return None
 
 
-def download_file(url: str, dest: str) -> bool:
-    """Télécharge un fichier via HTTP en écrivant les octets dans ``dest``.
-
-    Args:
-        url: L'URL à télécharger.
-        dest: Chemin du fichier de destination.
-
-    Returns:
-        ``True`` si le téléchargement s'est bien déroulé, ``False`` sinon.
-    """
+def download_file(url: str, dest: Path) -> bool:
+    tmp_path = dest.with_suffix(dest.suffix + ".tmp")
     try:
-        # Télécharge le fichier dans un fichier temporaire.
-        tmp_path = dest + ".tmp"
-        with urllib.request.urlopen(url, timeout=60) as response, open(tmp_path, "wb") as out:
-            # Lire en blocs pour gérer de gros fichiers.
-            block_size = 8192
+        with urllib.request.urlopen(url, timeout=SYNC_TIMEOUT_SECONDS) as response, tmp_path.open("wb") as out:
             while True:
-                chunk = response.read(block_size)
+                chunk = response.read(8192)
                 if not chunk:
                     break
                 out.write(chunk)
-        # Remplacement atomique du fichier
         os.replace(tmp_path, dest)
         return True
     except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
         return False
 
 
-def update_dataset() -> None:
-    """Vérifie la présence d'une nouvelle version et télécharge si nécessaire."""
-    ensure_data_dir()
-    metadata = fetch_metadata()
-    if not metadata:
-        # Impossible de récupérer les métadonnées ; on abandonne la mise à jour
-        return
-    zip_res = find_zip_resource(metadata)
-    if not zip_res:
-        # Aucune ressource ZIP trouvée ; rien à faire
-        return
+def read_archive_tables(zip_path: Path) -> Dict[str, List[Dict[str, str]]]:
+    tables: Dict[str, List[Dict[str, str]]] = {}
+    if not zip_path.exists():
+        return tables
 
-    # Date de mise à jour distante
-    remote_ts = parse_remote_date(zip_res.get("last_modified"))
-    # Date de fichier local
-    local_ts = None
-    if os.path.exists(DATA_ZIP_PATH):
-        local_ts = datetime.datetime.fromtimestamp(os.path.getmtime(DATA_ZIP_PATH))
-    # S'il n'y a pas de fichier local, on doit télécharger ; si les dates
-    # diffèrent et que la distante est plus récente, on télécharge aussi.
-    should_download = False
-    if not local_ts:
-        should_download = True
-    elif remote_ts and remote_ts > local_ts:
-        should_download = True
-    if should_download:
-        url = zip_res.get("url")
-        if url:
-            success = download_file(url, DATA_ZIP_PATH)
-            if success:
-                # On recharge les données en purgeant le cache
-                with data_lock:
-                    get_data.cache_clear()
-                    # Appel immédiat pour précharger
-                    get_data()
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        for filename in archive.namelist():
+            if not filename.lower().endswith(".csv"):
+                continue
+            with archive.open(filename) as handle:
+                raw = handle.read()
+            text = None
+            for encoding in ("utf-8", "latin-1"):
+                try:
+                    text = raw.decode(encoding)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if text is None:
+                continue
+            reader = csv.DictReader(io.StringIO(text))
+            basename = Path(filename).name.lower()
+            tables[basename] = [{(key or "").strip(): (value or "").strip() for key, value in row.items()} for row in reader]
+    return tables
 
 
-def schedule_update() -> None:
-    """Planifie l'exécution périodique de la mise à jour."""
-    def _run():
-        update_dataset()
-        # Planifie la prochaine exécution
-        timer = threading.Timer(UPDATE_INTERVAL, _run)
-        timer.daemon = True
-        timer.start()
-
-    # Lancement immédiat de la première exécution en arrière‑plan
-    timer0 = threading.Timer(0, _run)
-    timer0.daemon = True
-    timer0.start()
-
-
-def load_dataset() -> Dict[str, list]:
-    """Charge et parse ``Nom.csv`` et ``FusionScission.csv`` depuis l'archive ZIP.
-
-    Au lieu d'utiliser pandas, on s'appuie sur le module ``csv`` de la
-    bibliothèque standard pour lire les fichiers. Chaque fichier est
-    transformé en une liste de dictionnaires, où les clés correspondent
-    aux noms de colonnes et les valeurs sont des chaînes.
-
-    Returns:
-        Un dictionnaire ayant deux clés : ``nom.csv`` et ``fusionscission.csv``.
-        Chacune mappe vers une liste de lignes (dictionnaires). Si un fichier
-        est manquant, la liste sera vide.
-    """
-    if not os.path.exists(DATA_ZIP_PATH):
-        return {}
-    datasets: Dict[str, list] = {"nom.csv": [], "fusionscission.csv": []}
-    with data_lock:
-        try:
-            with zipfile.ZipFile(DATA_ZIP_PATH, "r") as archive:
-                for filename in archive.namelist():
-                    lower = filename.lower()
-                    base = os.path.basename(lower)
-                    if base == "nom.csv" or base == "fusionscission.csv":
-                        with archive.open(filename) as f:
-                            # Certaines lignes peuvent comporter un encodage latin‑1.
-                            # On essaie UTF‑è puis latin‑1.
-                            content = f.read()
-                            for encoding in ("utf-8", "latin-1"):
-                                try:
-                                    text = content.decode(encoding)
-                                    reader = csv.DictReader(text.splitlines())
-                                    datasets[base] = [ {k: (v or "").strip() for k, v in row.items()} for row in reader ]
-                                    break
-                                except Exception:
-                                    continue
-        except zipfile.BadZipFile:
-            return {}
-    return datasets
+def choose_company_name(row: Dict[str, str]) -> Optional[str]:
+    for key in (
+        "NOM_ASSUJ",
+        "DENOMN_SOC",
+        "NOM_ASSUJ_LANG_ETRNG",
+        "NOM_ASSUJ_ETRNG",
+        "NOM",
+    ):
+        value = row.get(key, "").strip()
+        if value:
+            return value
+    return None
 
 
-@lru_cache(maxsize=1)
-def get_data():
-    """Retourne les données et un dictionnaire de noms, mis en cache.
+def dataset_label_from_filename(filename: str) -> str:
+    label = Path(filename).stem.replace("_", " ").replace("-", " ").strip()
+    return label or filename
 
-    Le chargement des fichiers CSV peut être coûteux ; nous le faisons
-    uniquement lors du premier appel et stockons le résultat en cache. Les
-    données sont renvoyées sous forme de deux listes de dictionnaires ainsi
-    qu'un mapping ``NEQ → nom``.
 
-    Returns:
-        nom_list (List[Dict[str, str]]): lignes de ``Nom.csv``.
-        fusion_list (List[Dict[str, str]]): lignes de ``FusionScission.csv``.
-        names_map (Dict[str, str]): dictionnaire NEQ → nom de l'entreprise.
-    """
-    datasets = load_dataset()
-    nom_list: List[Dict[str, str]] = datasets.get("nom.csv", [])
-    fusion_list: List[Dict[str, str]] = datasets.get("fusionscission.csv", [])
-    names_map: Dict[str, str] = {}
-    # Extraire les noms à partir des différentes colonnes du fichier Nom.csv
-    for row in nom_list:
-        neq = row.get("NEQ", "").strip()
-        if not neq:
+def upsert_company(
+    conn: sqlite3.Connection,
+    neq: str,
+    label: str,
+    source: str,
+    aliases: Optional[Iterable[str]] = None,
+) -> str:
+    node_id = normalize_node_id(COMPANY_NODE, neq)
+    normalized_label = normalize_text(label or neq)
+    updated_at = utc_now_iso()
+    conn.execute(
+        """
+        INSERT INTO entities (node_id, entity_type, label, normalized_label, neq, source, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(node_id) DO UPDATE SET
+            label = excluded.label,
+            normalized_label = excluded.normalized_label,
+            neq = excluded.neq,
+            source = excluded.source,
+            updated_at = excluded.updated_at
+        """,
+        (node_id, COMPANY_NODE, label or neq, normalized_label, neq, source, updated_at),
+    )
+    alias_values = set(aliases or [])
+    alias_values.add(label or neq)
+    for alias in alias_values:
+        normalized_alias = normalize_text(alias)
+        if not normalized_alias:
             continue
-        # Les colonnes de noms possibles sont listées ici.
-        for col in ("NOM_ASSUJ", "DENOMN_SOC", "NOM_ASSUJ_LANG_ETRNG", "NOM_ASSUJ_ETRNG"):
-            val = row.get(col, "").strip()
-            if val:
-                names_map.setdefault(neq, val)
-                break
-    # Associer les NEQ présents uniquement dans FusionScission
-    for row in fusion_list:
-        src = row.get("NEQ_ASSUJ_REL", "").strip()
-        dst = row.get("NEQ", "").strip()
-        for neq in (src, dst):
-            if neq and neq not in names_map:
-                names_map[neq] = neq
-    return nom_list, fusion_list, names_map
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO entity_aliases (node_id, alias, normalized_alias, source)
+            VALUES (?, ?, ?, ?)
+            """,
+            (node_id, alias, normalized_alias, source),
+        )
+    return node_id
+
+
+def upsert_person(conn: sqlite3.Connection, name: str, source: str) -> str:
+    node_id = normalize_node_id(PERSON_NODE, name)
+    normalized_label = normalize_text(name)
+    updated_at = utc_now_iso()
+    conn.execute(
+        """
+        INSERT INTO entities (node_id, entity_type, label, normalized_label, neq, source, updated_at)
+        VALUES (?, ?, ?, ?, NULL, ?, ?)
+        ON CONFLICT(node_id) DO UPDATE SET
+            label = excluded.label,
+            normalized_label = excluded.normalized_label,
+            source = excluded.source,
+            updated_at = excluded.updated_at
+        """,
+        (node_id, PERSON_NODE, name, normalized_label, source, updated_at),
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO entity_aliases (node_id, alias, normalized_alias, source)
+        VALUES (?, ?, ?, ?)
+        """,
+        (node_id, name, normalized_label, source),
+    )
+    return node_id
+
+
+def insert_relation(
+    conn: sqlite3.Connection,
+    source_node_id: str,
+    target_node_id: str,
+    relation_type: str,
+    relation_label: str,
+    source_dataset: str,
+    source_detail: Optional[str] = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO relations
+        (source_node_id, target_node_id, relation_type, relation_label, source_dataset, source_detail, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            source_node_id,
+            target_node_id,
+            relation_type,
+            relation_label,
+            source_dataset,
+            source_detail,
+            utc_now_iso(),
+        ),
+    )
+
+
+def ingest_tables(tables: Dict[str, List[Dict[str, str]]]) -> Dict[str, int]:
+    stats = {
+        "tables": len(tables),
+        "companies": 0,
+        "people": 0,
+        "relations": 0,
+    }
+    with open_db() as conn:
+        conn.execute("DELETE FROM relations")
+        conn.execute("DELETE FROM entity_aliases")
+        conn.execute("DELETE FROM entities")
+
+        company_names: Dict[str, set] = {}
+        for filename, rows in tables.items():
+            if "nom" in filename:
+                for row in rows:
+                    neq = row.get("NEQ", "").strip()
+                    if not neq:
+                        continue
+                    aliases = {
+                        value.strip()
+                        for key, value in row.items()
+                        if key
+                        in {
+                            "NOM_ASSUJ",
+                            "DENOMN_SOC",
+                            "NOM_ASSUJ_LANG_ETRNG",
+                            "NOM_ASSUJ_ETRNG",
+                        }
+                        and value
+                    }
+                    label = choose_company_name(row) or neq
+                    company_names.setdefault(neq, set()).update(aliases or {label})
+
+        for neq, aliases in company_names.items():
+            upsert_company(conn, neq, sorted(aliases)[0], "req-open-data", aliases=aliases)
+
+        relation_files = 0
+        for filename, rows in tables.items():
+            if not rows:
+                continue
+            sample_keys = {key for key in rows[0].keys() if key}
+
+            if {"NEQ", "NEQ_ASSUJ_REL"}.issubset(sample_keys):
+                relation_files += 1
+                dataset_label = dataset_label_from_filename(filename)
+                for row in rows:
+                    src_neq = row.get("NEQ_ASSUJ_REL", "").strip()
+                    dst_neq = row.get("NEQ", "").strip()
+                    if not src_neq or not dst_neq:
+                        continue
+                    src_name = company_names.get(src_neq, {src_neq})
+                    dst_name = company_names.get(dst_neq, {dst_neq})
+                    src_node_id = upsert_company(conn, src_neq, sorted(src_name)[0], "req-open-data", aliases=src_name)
+                    dst_node_id = upsert_company(conn, dst_neq, sorted(dst_name)[0], "req-open-data", aliases=dst_name)
+                    relation_code = row.get("COD_RELA_ASSUJ", "").strip() or filename
+                    insert_relation(
+                        conn,
+                        src_node_id,
+                        dst_node_id,
+                        f"company_relation:{relation_code}",
+                        dataset_label,
+                        filename,
+                        relation_code,
+                    )
+
+            # This supports future enrichment sources where persons are present.
+            if {"NEQ", "NOM_PRENOM"}.issubset(sample_keys):
+                dataset_label = dataset_label_from_filename(filename)
+                for row in rows:
+                    neq = row.get("NEQ", "").strip()
+                    full_name = row.get("NOM_PRENOM", "").strip()
+                    if not neq or not full_name:
+                        continue
+                    company_aliases = company_names.get(neq, {neq})
+                    company_id = upsert_company(conn, neq, sorted(company_aliases)[0], "req-open-data", aliases=company_aliases)
+                    person_id = upsert_person(conn, full_name, "enrichment")
+                    role = row.get("ROLE", "").strip() or row.get("FONCTION", "").strip() or "personne liée"
+                    insert_relation(
+                        conn,
+                        company_id,
+                        person_id,
+                        f"person_role:{normalize_text(role)}",
+                        role,
+                        filename,
+                    )
+
+        stats["companies"] = conn.execute(
+            "SELECT COUNT(*) AS total FROM entities WHERE entity_type = ?",
+            (COMPANY_NODE,),
+        ).fetchone()["total"]
+        stats["people"] = conn.execute(
+            "SELECT COUNT(*) AS total FROM entities WHERE entity_type = ?",
+            (PERSON_NODE,),
+        ).fetchone()["total"]
+        stats["relations"] = conn.execute("SELECT COUNT(*) AS total FROM relations").fetchone()["total"]
+        conn.execute("REPLACE INTO metadata (key, value) VALUES (?, ?)", ("last_ingest_at", utc_now_iso()))
+        conn.execute(
+            "REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            ("last_table_count", str(relation_files)),
+        )
+    return stats
+
+
+def sync_dataset(force: bool = False) -> Dict[str, object]:
+    with data_lock:
+        sync_state["is_running"] = True
+        sync_state["last_started_at"] = local_now_iso()
+        sync_state["last_error"] = None
+
+        try:
+            ensure_data_dir()
+            metadata = fetch_metadata()
+            zip_resource = find_zip_resource(metadata or {})
+
+            if not zip_resource and REQ_DATASET_ZIP_URL:
+                zip_resource = {
+                    "url": REQ_DATASET_ZIP_URL,
+                    "last_modified": None,
+                    "name": "REQ dataset ZIP (manual override)",
+                }
+
+            if not zip_resource:
+                raise RuntimeError(
+                    "Impossible de trouver la ressource ZIP du REQ. "
+                    "Définis REQ_DATASET_ZIP_URL si le portail CKAN répond 403."
+                )
+
+            remote_ts = parse_remote_date(zip_resource.get("last_modified", ""))
+            local_ts = None
+            if DATA_ZIP_PATH.exists():
+                local_ts = dt.datetime.fromtimestamp(DATA_ZIP_PATH.stat().st_mtime, tz=dt.timezone.utc)
+
+            should_download = force or not DATA_ZIP_PATH.exists()
+            if remote_ts and local_ts and remote_ts > local_ts:
+                should_download = True
+
+            if should_download:
+                url = zip_resource.get("url")
+                if not url:
+                    raise RuntimeError("La ressource ZIP ne contient pas d'URL téléchargeable.")
+                if not download_file(url, DATA_ZIP_PATH):
+                    raise RuntimeError("Le téléchargement du jeu de données a échoué.")
+
+            tables = read_archive_tables(DATA_ZIP_PATH)
+            if not tables:
+                raise RuntimeError("Aucun fichier CSV exploitable n'a été trouvé dans l'archive.")
+
+            stats = ingest_tables(tables)
+            result = {
+                "downloaded": should_download,
+                "remote_last_modified": zip_resource.get("last_modified"),
+                "stats": stats,
+                "source_note": (
+                    "Le jeu de données ouvert du REQ exclut les noms et prénoms des personnes physiques. "
+                    "Le graphe des personnes est donc prêt pour de l'enrichissement, mais restera vide "
+                    "sans source complémentaire autorisée."
+                ),
+            }
+            sync_state["last_success_at"] = local_now_iso()
+            return result
+        except Exception as exc:
+            sync_state["last_error"] = str(exc)
+            raise
+        finally:
+            sync_state["is_running"] = False
+            sync_state["last_completed_at"] = local_now_iso()
+
+
+def get_metadata_value(key: str) -> Optional[str]:
+    with open_db() as conn:
+        row = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def get_summary() -> Dict[str, object]:
+    with open_db() as conn:
+        company_total = conn.execute(
+            "SELECT COUNT(*) AS total FROM entities WHERE entity_type = ?",
+            (COMPANY_NODE,),
+        ).fetchone()["total"]
+        person_total = conn.execute(
+            "SELECT COUNT(*) AS total FROM entities WHERE entity_type = ?",
+            (PERSON_NODE,),
+        ).fetchone()["total"]
+        relation_total = conn.execute("SELECT COUNT(*) AS total FROM relations").fetchone()["total"]
+
+    return {
+        "companies": company_total,
+        "people": person_total,
+        "relations": relation_total,
+        "last_ingest_at": get_metadata_value("last_ingest_at"),
+        "sync": dict(sync_state),
+        "constraints": [
+            "Les données ouvertes REQ couvrent toutes les entreprises, mais anonymisent les personnes physiques.",
+            "Les liens vers actionnaires, administrateurs et bénéficiaires ultimes exigent une source complémentaire autorisée.",
+        ],
+    }
+
+
+def search_entities(query: str) -> List[Dict[str, str]]:
+    needle = normalize_text(query)
+    if not needle:
+        return []
+
+    with open_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                e.node_id,
+                e.entity_type,
+                e.label,
+                e.neq,
+                MIN(a.alias) AS matched_alias
+            FROM entity_aliases a
+            JOIN entities e ON e.node_id = a.node_id
+            WHERE a.normalized_alias LIKE ?
+               OR (e.neq IS NOT NULL AND e.neq LIKE ?)
+            GROUP BY e.node_id, e.entity_type, e.label, e.neq
+            ORDER BY
+                CASE WHEN e.entity_type = 'company' THEN 0 ELSE 1 END,
+                LENGTH(e.label),
+                e.label
+            LIMIT ?
+            """,
+            (f"%{needle}%", f"%{query.strip()}%", MAX_SEARCH_RESULTS),
+        ).fetchall()
+
+    return [
+        {
+            "id": row["node_id"],
+            "type": row["entity_type"],
+            "label": row["label"],
+            "neq": row["neq"] or "",
+            "matched_alias": row["matched_alias"] or row["label"],
+        }
+        for row in rows
+    ]
+
+
+def fetch_graph(node_id: str) -> Dict[str, List[Dict[str, object]]]:
+    with open_db() as conn:
+        nodes = {}
+        relations = conn.execute(
+            """
+            SELECT *
+            FROM relations
+            WHERE source_node_id = ? OR target_node_id = ?
+            LIMIT ?
+            """,
+            (node_id, node_id, MAX_GRAPH_EDGES),
+        ).fetchall()
+        if not relations:
+            entity = conn.execute("SELECT * FROM entities WHERE node_id = ?", (node_id,)).fetchone()
+            if not entity:
+                return {"nodes": [], "links": []}
+            return {
+                "nodes": [
+                    {
+                        "id": entity["node_id"],
+                        "label": entity["label"],
+                        "type": entity["entity_type"],
+                        "neq": entity["neq"] or "",
+                    }
+                ],
+                "links": [],
+            }
+
+        links = []
+        related_ids = {node_id}
+        for relation in relations:
+            related_ids.add(relation["source_node_id"])
+            related_ids.add(relation["target_node_id"])
+            links.append(
+                {
+                    "source": relation["source_node_id"],
+                    "target": relation["target_node_id"],
+                    "label": relation["relation_label"],
+                    "type": relation["relation_type"],
+                    "dataset": relation["source_dataset"],
+                }
+            )
+
+        placeholders = ",".join("?" for _ in related_ids)
+        entity_rows = conn.execute(
+            f"SELECT * FROM entities WHERE node_id IN ({placeholders})",
+            tuple(related_ids),
+        ).fetchall()
+        for entity in entity_rows:
+            nodes[entity["node_id"]] = {
+                "id": entity["node_id"],
+                "label": entity["label"],
+                "type": entity["entity_type"],
+                "neq": entity["neq"] or "",
+            }
+        return {"nodes": list(nodes.values()), "links": links}
+
+
+def sync_worker_loop() -> None:
+    while True:
+        try:
+            sync_dataset(force=False)
+        except Exception:
+            pass
+        time.sleep(UPDATE_INTERVAL_SECONDS)
+
+
+def maybe_start_sync_loop() -> None:
+    if not AUTO_SYNC_ENABLED:
+        return
+    thread = threading.Thread(target=sync_worker_loop, daemon=True, name="req-sync")
+    thread.start()
+
+
+def check_admin_token(req) -> bool:
+    if not ADMIN_SYNC_TOKEN:
+        return True
+    provided = req.headers.get("X-Admin-Sync-Token", "")
+    return provided == ADMIN_SYNC_TOKEN
 
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", summary=get_summary())
+
+
+@app.route("/api/summary")
+def api_summary():
+    return jsonify(get_summary())
 
 
 @app.route("/api/search")
 def api_search():
-    query = request.args.get("q", "").strip().lower()
-    results: List[Dict[str, str]] = []
-    _, _, names_map = get_data()
-    if not query:
-        return jsonify(results)
-    for neq, name in names_map.items():
-        if query in neq.lower() or query in name.lower():
-            results.append({"neq": neq, "name": name})
-            if len(results) >= 20:
-                break
-    results.sort(key=lambda x: x["name"])
-    return jsonify(results)
+    query = request.args.get("q", "")
+    return jsonify(search_entities(query))
 
 
 @app.route("/api/network")
 def api_network():
-    target_neq = request.args.get("neq", "").strip()
-    if not target_neq:
+    node_id = request.args.get("id", "").strip()
+    neq = request.args.get("neq", "").strip()
+    if not node_id and neq:
+        node_id = normalize_node_id(COMPANY_NODE, neq)
+    if not node_id:
         return jsonify({"nodes": [], "links": []})
-    _, fusion_list, names_map = get_data()
-    if not fusion_list:
-        return jsonify({"nodes": [], "links": []})
-    nodes_set: set = set()
-    links: List[Dict[str, str]] = []
-    # Filtrer toutes les lignes où target_neq apparaît soit comme NEQ, soit
-    # comme NEQ_ASSUJ_REL. On ne récupère que les relations directes pour
-    # éviter de surcharger la visualisation.
-    for row in fusion_list:
-        src = row.get("NEQ_ASSUJ_REL", "").strip()
-        dst = row.get("NEQ", "").strip()
-        relation = row.get("COD_RELA_ASSUJ", "").strip()
-        if not src or not dst:
-            continue
-        if src == target_neq or dst == target_neq:
-            links.append({"source": src, "target": dst, "relation": relation})
-            nodes_set.update([src, dst])
-    nodes = [{"id": n, "name": names_map.get(n, n)} for n in nodes_set]
-    return jsonify({"nodes": nodes, "links": links})
+    return jsonify(fetch_graph(node_id))
+
+
+@app.route("/api/sync", methods=["GET", "POST"])
+def api_sync():
+    if request.method == "POST":
+        if not check_admin_token(request):
+            return jsonify({"error": "Unauthorized"}), 401
+        force = request.args.get("force", "0") == "1"
+        try:
+            result = sync_dataset(force=force)
+            return jsonify({"ok": True, **result})
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc), "sync": dict(sync_state)}), 500
+    return jsonify({"ok": True, "sync": dict(sync_state), "summary": get_summary()})
+
+
+def bootstrap() -> None:
+    init_db()
+    if not get_metadata_value("last_ingest_at") and DATA_ZIP_PATH.exists():
+        try:
+            ingest_tables(read_archive_tables(DATA_ZIP_PATH))
+        except Exception:
+            pass
+    maybe_start_sync_loop()
+
+
+def main() -> None:
+    bootstrap()
+    mode = os.environ.get("APP_MODE", "").strip().lower()
+    if len(os.sys.argv) > 1:
+        mode = os.sys.argv[1].strip().lower()
+
+    if mode == "sync":
+        result = sync_dataset(force=True)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+
+    debug = os.environ.get("FLASK_DEBUG", "0") == "1"
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(debug=debug, host="0.0.0.0", port=port)
+
+
+bootstrap()
 
 
 if __name__ == "__main__":
-    # Démarre la tâche de mise à jour en arrière‑plan
-    schedule_update()
-    # Précharge les données lors du démarrage pour réduire le délai de la
-    # première requête. Si le fichier n'existe pas encore, la tâche de mise à
-    # jour le téléchargera et remplira le cache.
-    get_data()
-    app.run(debug=True, host="0.0.0.0")
+    main()

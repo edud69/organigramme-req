@@ -2,179 +2,490 @@
 <html lang="fr">
 <head>
   <meta charset="UTF-8">
-  <title>Organigramme des entreprises du Québec</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Organigramme REQ Québec</title>
   <script src="https://d3js.org/d3.v7.min.js"></script>
   <style>
+    :root {
+      --bg: #f6f1e8;
+      --panel: rgba(255, 251, 245, 0.84);
+      --panel-strong: #fffaf1;
+      --ink: #1d2b28;
+      --muted: #5b6a67;
+      --line: rgba(29, 43, 40, 0.14);
+      --accent: #0d7c66;
+      --accent-strong: #07473d;
+      --company: #0d7c66;
+      --person: #c65b37;
+      --link: rgba(8, 48, 42, 0.28);
+      --warning: #8f5f00;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
     body {
-      font-family: Arial, sans-serif;
       margin: 0;
-      padding: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(13, 124, 102, 0.16), transparent 32%),
+        radial-gradient(circle at right 20%, rgba(198, 91, 55, 0.14), transparent 28%),
+        linear-gradient(180deg, #f9f4eb 0%, var(--bg) 100%);
     }
-    header {
-      background-color: #2f6ebd;
-      color: white;
-      padding: 1rem;
+
+    .shell {
+      display: grid;
+      grid-template-columns: 360px 1fr;
+      min-height: 100vh;
+      gap: 1px;
+      background: rgba(29, 43, 40, 0.08);
     }
+
+    .sidebar,
+    .stage {
+      background: var(--panel);
+      backdrop-filter: blur(16px);
+    }
+
+    .sidebar {
+      padding: 28px 22px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .eyebrow {
+      margin: 0 0 10px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--accent-strong);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
     h1 {
       margin: 0;
-      font-size: 1.5rem;
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: 34px;
+      line-height: 1.02;
     }
-    #search-container {
-      padding: 1rem;
-    }
-    #search-results {
-      list-style: none;
+
+    .lede,
+    .meta,
+    .constraint {
       margin: 0;
-      padding: 0;
-      max-height: 200px;
-      overflow-y: auto;
-      border: 1px solid #ddd;
+      color: var(--muted);
+      line-height: 1.5;
     }
-    #search-results li {
-      padding: 0.5rem;
-      cursor: pointer;
+
+    .panel {
+      background: var(--panel-strong);
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 18px;
+      box-shadow: 0 16px 40px rgba(27, 29, 24, 0.06);
     }
-    #search-results li:hover {
-      background-color: #f0f0f0;
-    }
-    #graph {
+
+    .search-input {
       width: 100%;
-      height: 600px;
-      border-top: 1px solid #ccc;
+      border: 1px solid rgba(8, 71, 61, 0.18);
+      border-radius: 14px;
+      padding: 14px 16px;
+      font-size: 16px;
+      background: #fff;
+      color: var(--ink);
     }
-    .link {
-      stroke: #999;
-      stroke-opacity: 0.6;
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
     }
-    .node {
+
+    .stat {
+      padding: 14px;
+      border-radius: 16px;
+      background: rgba(13, 124, 102, 0.07);
+      border: 1px solid rgba(13, 124, 102, 0.12);
+    }
+
+    .stat strong {
+      display: block;
+      font-size: 22px;
+      margin-bottom: 4px;
+    }
+
+    .result-list {
+      margin: 14px 0 0;
+      padding: 0;
+      list-style: none;
+      display: grid;
+      gap: 8px;
+      max-height: 300px;
+      overflow: auto;
+    }
+
+    .result-list button {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      text-align: left;
+      padding: 12px 14px;
       cursor: pointer;
+      background: #fff;
+      color: inherit;
     }
-    .node circle {
-      stroke: #fff;
-      stroke-width: 1.5px;
+
+    .result-list button:hover {
+      border-color: rgba(13, 124, 102, 0.4);
+      transform: translateY(-1px);
     }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .tag.company {
+      color: var(--company);
+      background: rgba(13, 124, 102, 0.12);
+    }
+
+    .tag.person {
+      color: var(--person);
+      background: rgba(198, 91, 55, 0.12);
+    }
+
+    .stage {
+      position: relative;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .stage-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 22px 24px 12px;
+      gap: 20px;
+    }
+
+    .stage-note {
+      color: var(--warning);
+      font-size: 14px;
+      margin: 0;
+    }
+
+    #graph {
+      position: relative;
+      flex: 1;
+      min-height: 620px;
+    }
+
+    .legend {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .legend span {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+
+    .dot.company {
+      background: var(--company);
+    }
+
+    .dot.person {
+      background: var(--person);
+    }
+
     .tooltip {
       position: absolute;
-      text-align: center;
-      padding: 4px;
-      font-size: 12px;
-      background: rgba(0, 0, 0, 0.6);
-      color: #fff;
-      border-radius: 4px;
       pointer-events: none;
+      background: rgba(20, 28, 26, 0.92);
+      color: #fff;
+      padding: 10px 12px;
+      border-radius: 12px;
+      font-size: 13px;
+      line-height: 1.4;
+      box-shadow: 0 14px 34px rgba(0, 0, 0, 0.22);
+      opacity: 0;
+      transform: translateY(4px);
+      transition: opacity 140ms ease, transform 140ms ease;
+    }
+
+    .empty {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      padding: 30px;
+      text-align: center;
+      color: var(--muted);
+    }
+
+    .caption {
+      margin-top: 6px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    @media (max-width: 980px) {
+      .shell {
+        grid-template-columns: 1fr;
+      }
+
+      #graph {
+        min-height: 520px;
+      }
     }
   </style>
 </head>
 <body>
-  <header>
-    <h1>Organigramme des entreprises du Québec</h1>
-  </header>
-  <div id="search-container">
-    <label for="search-input">Recherche :</label>
-    <input id="search-input" type="text" placeholder="Nom ou NEQ" autofocus>
-    <ul id="search-results"></ul>
+  <div class="shell">
+    <aside class="sidebar">
+      <section>
+        <p class="eyebrow">Registre des entreprises du Québec</p>
+        <h1>Organigramme visuel et moteur de recherche</h1>
+        <p class="lede">Recherche une compagnie par nom ou NEQ, puis explore ses liens relationnels dans les données ouvertes REQ déjà synchronisées.</p>
+      </section>
+
+      <section class="panel">
+        <input id="search-input" class="search-input" type="text" placeholder="Chercher une compagnie ou un NEQ" autofocus>
+        <ul id="search-results" class="result-list"></ul>
+      </section>
+
+      <section class="stats">
+        <div class="stat">
+          <strong id="companies-count">{{ summary.companies }}</strong>
+          <span>compagnies indexées</span>
+        </div>
+        <div class="stat">
+          <strong id="relations-count">{{ summary.relations }}</strong>
+          <span>relations trouvées</span>
+        </div>
+        <div class="stat">
+          <strong id="people-count">{{ summary.people }}</strong>
+          <span>personnes enrichies</span>
+        </div>
+        <div class="stat">
+          <strong id="sync-state">{{ "oui" if summary.sync.last_success_at else "non" }}</strong>
+          <span>sync réussi</span>
+        </div>
+      </section>
+
+      <section class="panel">
+        <p class="meta"><strong>Dernière ingestion:</strong> <span id="last-ingest">{{ summary.last_ingest_at or "aucune" }}</span></p>
+        <p class="caption">Le sync automatique côté app tourne toutes les 24 heures quand le service reste actif.</p>
+      </section>
+
+      <section class="panel">
+        <p class="constraint">Le dataset REQ ouvert anonymise les personnes physiques. Les nœuds de personnes sont donc prévus par l’application, mais nécessitent une source complémentaire autorisée pour apparaître.</p>
+      </section>
+    </aside>
+
+    <main class="stage">
+      <div class="stage-header">
+        <div>
+          <p class="eyebrow">Vue graphe</p>
+          <p id="selection-title" class="meta">Choisis une entité dans les résultats pour afficher son réseau.</p>
+        </div>
+        <div class="legend">
+          <span><i class="dot company"></i> Compagnie</span>
+          <span><i class="dot person"></i> Personne physique</span>
+        </div>
+      </div>
+      <p class="stage-note">Le graphe affiche les relations directes disponibles dans la base locale. Les libellés dépendent des fichiers REQ présents dans l’archive.</p>
+      <div id="graph">
+        <div id="empty-state" class="empty">
+          <div>
+            <h2 style="margin:0 0 8px;font-family:Georgia,serif;">La carte attend un point de départ</h2>
+            <p class="meta">Commence par rechercher une entreprise. Le graphe se centrera sur cette entité et ses relations directes.</p>
+          </div>
+        </div>
+      </div>
+      <div id="tooltip" class="tooltip"></div>
+    </main>
   </div>
-  <div id="graph"></div>
 
   <script>
-    (function() {
+    (() => {
       const searchInput = document.getElementById('search-input');
       const searchResults = document.getElementById('search-results');
+      const graphEl = document.getElementById('graph');
+      const emptyState = document.getElementById('empty-state');
+      const tooltip = document.getElementById('tooltip');
+      const selectionTitle = document.getElementById('selection-title');
       let timeoutId = null;
 
-      function performSearch(query) {
+      function formatType(type) {
+        return type === 'person' ? 'Personne physique' : 'Compagnie';
+      }
+
+      function renderResults(items) {
+        searchResults.innerHTML = '';
+        items.forEach((item) => {
+          const li = document.createElement('li');
+          const button = document.createElement('button');
+          button.innerHTML = `
+            <span class="tag ${item.type}">${formatType(item.type)}</span>
+            <div style="margin-top:8px;font-weight:700;">${item.label}</div>
+            <div class="caption">${item.neq ? `NEQ: ${item.neq}` : item.matched_alias}</div>
+          `;
+          button.addEventListener('click', () => selectEntity(item));
+          li.appendChild(button);
+          searchResults.appendChild(li);
+        });
+      }
+
+      async function refreshSummary() {
+        const resp = await fetch('/api/summary');
+        const data = await resp.json();
+        document.getElementById('companies-count').textContent = data.companies;
+        document.getElementById('relations-count').textContent = data.relations;
+        document.getElementById('people-count').textContent = data.people;
+        document.getElementById('sync-state').textContent = data.sync.last_success_at ? 'oui' : 'non';
+        document.getElementById('last-ingest').textContent = data.last_ingest_at || 'aucune';
+      }
+
+      async function performSearch(query) {
         if (!query) {
           searchResults.innerHTML = '';
           return;
         }
-        fetch('/api/search?q=' + encodeURIComponent(query))
-          .then(resp => resp.json())
-          .then(data => {
-            searchResults.innerHTML = '';
-            data.forEach(item => {
-              const li = document.createElement('li');
-              li.textContent = `${item.name} (NEQ : ${item.neq})`;
-              li.onclick = () => selectEntity(item);
-              searchResults.appendChild(li);
-            });
-          });
+        const resp = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
+        const data = await resp.json();
+        renderResults(data);
       }
 
       function selectEntity(item) {
+        selectionTitle.textContent = `${item.label}${item.neq ? ` · ${item.neq}` : ''}`;
+        searchInput.value = item.label;
         searchResults.innerHTML = '';
-        searchInput.value = `${item.name}`;
-        loadNetwork(item.neq);
+        loadGraph(item.id);
       }
 
-      function loadNetwork(neq) {
-        fetch('/api/network?neq=' + encodeURIComponent(neq))
-          .then(resp => resp.json())
-          .then(data => {
-            drawGraph(data, neq);
-          });
+      async function loadGraph(nodeId) {
+        const resp = await fetch(`/api/network?id=${encodeURIComponent(nodeId)}`);
+        const data = await resp.json();
+        drawGraph(data, nodeId);
       }
 
-      function drawGraph(data, selectedNeq) {
-        const width = document.getElementById('graph').clientWidth;
-        const height = document.getElementById('graph').clientHeight;
-        const svg = d3.select('#graph').html('').append('svg')
+      function drawGraph(data, selectedId) {
+        const width = graphEl.clientWidth;
+        const height = graphEl.clientHeight;
+        graphEl.querySelectorAll('svg').forEach((node) => node.remove());
+        emptyState.style.display = data.nodes.length ? 'none' : 'grid';
+        if (!data.nodes.length) {
+          return;
+        }
+
+        const svg = d3.select('#graph')
+          .append('svg')
           .attr('width', width)
           .attr('height', height);
 
-        const tooltip = d3.select('body').append('div')
-          .attr('class', 'tooltip')
-          .style('opacity', 0);
-
-        const link = svg.append('g')
-          .attr('class', 'links')
+        svg.append('g')
           .selectAll('line')
           .data(data.links)
-          .enter().append('line')
-          .attr('class', 'link')
-          .attr('stroke-width', 1.5);
+          .enter()
+          .append('line')
+          .attr('stroke', 'var(--link)')
+          .attr('stroke-width', 1.6);
+
+        const linkLabels = svg.append('g')
+          .selectAll('text')
+          .data(data.links)
+          .enter()
+          .append('text')
+          .attr('font-size', 11)
+          .attr('fill', '#4b5d58')
+          .attr('text-anchor', 'middle')
+          .text((d) => d.label || '');
 
         const node = svg.append('g')
-          .attr('class', 'nodes')
           .selectAll('g')
           .data(data.nodes)
-          .enter().append('g')
-          .attr('class', 'node')
-          .call(d3.drag()
-            .on('start', dragstarted)
-            .on('drag', dragged)
-            .on('end', dragended));
+          .enter()
+          .append('g')
+          .call(
+            d3.drag()
+              .on('start', dragstarted)
+              .on('drag', dragged)
+              .on('end', dragended)
+          );
 
         node.append('circle')
-          .attr('r', 6)
-          .attr('fill', d => d.id === selectedNeq ? '#2f6ebd' : '#69b3a2');
+          .attr('r', (d) => d.id === selectedId ? 15 : 11)
+          .attr('fill', (d) => d.type === 'person' ? 'var(--person)' : 'var(--company)')
+          .attr('stroke', (d) => d.id === selectedId ? '#1d2b28' : '#fffaf1')
+          .attr('stroke-width', 3);
 
         node.append('text')
-          .attr('x', 8)
-          .attr('y', 3)
-          .text(d => d.name)
-          .style('font-size', '10px');
+          .attr('x', 16)
+          .attr('y', 4)
+          .attr('font-size', 12)
+          .attr('fill', '#20322f')
+          .text((d) => d.label);
 
-        node.on('mouseover', (event, d) => {
-          tooltip.transition().duration(200).style('opacity', 0.9);
-          tooltip.html(`<strong>${d.name}</strong><br/>NEQ : ${d.id}`)
-            .style('left', (event.pageX + 10) + 'px')
-            .style('top', (event.pageY - 28) + 'px');
-        }).on('mouseout', () => {
-          tooltip.transition().duration(500).style('opacity', 0);
+        node.on('mouseenter', (event, d) => {
+          tooltip.style.opacity = '1';
+          tooltip.style.transform = 'translateY(0)';
+          tooltip.innerHTML = `
+            <strong>${d.label}</strong><br>
+            ${formatType(d.type)}${d.neq ? `<br>NEQ: ${d.neq}` : ''}
+          `;
+          tooltip.style.left = `${event.pageX + 12}px`;
+          tooltip.style.top = `${event.pageY - 20}px`;
+        });
+
+        node.on('mouseleave', () => {
+          tooltip.style.opacity = '0';
+          tooltip.style.transform = 'translateY(4px)';
         });
 
         const simulation = d3.forceSimulation(data.nodes)
-          .force('link', d3.forceLink(data.links).id(d => d.id).distance(120))
-          .force('charge', d3.forceManyBody().strength(-300))
-          .force('center', d3.forceCenter(width / 2, height / 2));
+          .force('link', d3.forceLink(data.links).id((d) => d.id).distance(150))
+          .force('charge', d3.forceManyBody().strength(-480))
+          .force('center', d3.forceCenter(width / 2, height / 2))
+          .force('collision', d3.forceCollide().radius((d) => d.id === selectedId ? 50 : 34));
 
         simulation.on('tick', () => {
-          link
-            .attr('x1', d => d.source.x)
-            .attr('y1', d => d.source.y)
-            .attr('x2', d => d.target.x)
-            .attr('y2', d => d.target.y);
-          node.attr('transform', d => `translate(${d.x},${d.y})`);
+          svg.selectAll('line')
+            .attr('x1', (d) => d.source.x)
+            .attr('y1', (d) => d.source.y)
+            .attr('x2', (d) => d.target.x)
+            .attr('y2', (d) => d.target.y);
+
+          linkLabels
+            .attr('x', (d) => (d.source.x + d.target.x) / 2)
+            .attr('y', (d) => (d.source.y + d.target.y) / 2 - 8);
+
+          node.attr('transform', (d) => `translate(${d.x},${d.y})`);
         });
 
         function dragstarted(event, d) {
@@ -182,10 +493,12 @@
           d.fx = d.x;
           d.fy = d.y;
         }
+
         function dragged(event, d) {
           d.fx = event.x;
           d.fy = event.y;
         }
+
         function dragended(event, d) {
           if (!event.active) simulation.alphaTarget(0);
           d.fx = null;
@@ -195,11 +508,17 @@
 
       searchInput.addEventListener('input', () => {
         clearTimeout(timeoutId);
-        const value = searchInput.value.trim();
-        timeoutId = setTimeout(() => {
-          performSearch(value);
-        }, 300);
+        timeoutId = setTimeout(() => performSearch(searchInput.value.trim()), 220);
       });
+
+      window.addEventListener('resize', () => {
+        const current = searchInput.value.trim();
+        if (current) {
+          performSearch(current);
+        }
+      });
+
+      refreshSummary();
     })();
   </script>
 </body>
