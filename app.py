@@ -5,21 +5,25 @@ import io
 import json
 import logging
 import os
-import sqlite3
 import threading
 import time
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional
 
 from flask import Flask, jsonify, render_template, request
+from sqlalchemy import bindparam, create_engine, text
+from sqlalchemy.engine import Connection, Engine
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+DEFAULT_DATA_DIR = Path("/tmp/organigramme-req") if DATABASE_URL else BASE_DIR / "data"
+DATA_DIR = Path(os.environ.get("REQ_DATA_DIR", str(DEFAULT_DATA_DIR)))
 DATA_ZIP_PATH = DATA_DIR / "req-dataset.zip"
 DB_PATH = DATA_DIR / "req_cache.sqlite3"
+APP_SKIP_BOOTSTRAP = os.environ.get("APP_SKIP_BOOTSTRAP", "0") == "1"
 
 CKAN_PACKAGE_URL = os.environ.get(
     "REQ_CKAN_PACKAGE_URL",
@@ -51,6 +55,7 @@ sync_state = {
     "last_result": None,
 }
 sync_thread: Optional[threading.Thread] = None
+db_engine: Optional[Engine] = None
 
 
 def ensure_data_dir() -> None:
@@ -65,65 +70,106 @@ def local_now_iso() -> str:
     return dt.datetime.now().astimezone().isoformat()
 
 
-def open_db() -> sqlite3.Connection:
+def get_database_url() -> str:
+    if DATABASE_URL:
+        if DATABASE_URL.startswith("postgres://"):
+            return DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
+        if DATABASE_URL.startswith("postgresql://"):
+            return DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+        return DATABASE_URL
     ensure_data_dir()
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    return f"sqlite:///{DB_PATH}"
+
+
+def get_engine() -> Engine:
+    global db_engine
+    if db_engine is None:
+        db_engine = create_engine(get_database_url(), pool_pre_ping=True, future=True)
+    return db_engine
+
+
+def reset_engine() -> None:
+    global db_engine
+    if db_engine is not None:
+        db_engine.dispose()
+    db_engine = None
+
+
+def is_postgres() -> bool:
+    return get_engine().dialect.name == "postgresql"
+
+
+def open_db() -> Connection:
+    return get_engine().connect()
+
+
+def open_db_tx():
+    return get_engine().begin()
 
 
 def init_db() -> None:
-    with open_db() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS metadata (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS entities (
-                node_id TEXT PRIMARY KEY,
-                entity_type TEXT NOT NULL,
-                label TEXT NOT NULL,
-                normalized_label TEXT NOT NULL,
-                neq TEXT,
-                source TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS entity_aliases (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                node_id TEXT NOT NULL,
-                alias TEXT NOT NULL,
-                normalized_alias TEXT NOT NULL,
-                source TEXT NOT NULL,
-                UNIQUE(node_id, normalized_alias)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_entity_aliases_normalized
-            ON entity_aliases(normalized_alias);
-
-            CREATE TABLE IF NOT EXISTS relations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_node_id TEXT NOT NULL,
-                target_node_id TEXT NOT NULL,
-                relation_type TEXT NOT NULL,
-                relation_label TEXT NOT NULL,
-                source_dataset TEXT NOT NULL,
-                source_detail TEXT,
-                updated_at TEXT NOT NULL,
-                UNIQUE(source_node_id, target_node_id, relation_type, source_dataset, source_detail)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_relations_source
-            ON relations(source_node_id);
-
-            CREATE INDEX IF NOT EXISTS idx_relations_target
-            ON relations(target_node_id);
-            """
+    entity_aliases_id = "BIGSERIAL PRIMARY KEY" if is_postgres() else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    relations_id = "BIGSERIAL PRIMARY KEY" if is_postgres() else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    with open_db_tx() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
         )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS entities (
+                    node_id TEXT PRIMARY KEY,
+                    entity_type TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    normalized_label TEXT NOT NULL,
+                    neq TEXT,
+                    source TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                f"""
+                CREATE TABLE IF NOT EXISTS entity_aliases (
+                    id {entity_aliases_id},
+                    node_id TEXT NOT NULL,
+                    alias TEXT NOT NULL,
+                    normalized_alias TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    UNIQUE(node_id, normalized_alias)
+                )
+                """
+            )
+        )
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_entity_aliases_normalized ON entity_aliases(normalized_alias)"))
+        conn.execute(
+            text(
+                f"""
+                CREATE TABLE IF NOT EXISTS relations (
+                    id {relations_id},
+                    source_node_id TEXT NOT NULL,
+                    target_node_id TEXT NOT NULL,
+                    relation_type TEXT NOT NULL,
+                    relation_label TEXT NOT NULL,
+                    source_dataset TEXT NOT NULL,
+                    source_detail TEXT,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(source_node_id, target_node_id, relation_type, source_dataset, source_detail)
+                )
+                """
+            )
+        )
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_relations_source ON relations(source_node_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_relations_target ON relations(target_node_id)"))
 
 
 def normalize_text(value: str) -> str:
@@ -237,7 +283,7 @@ def dataset_label_from_filename(filename: str) -> str:
 
 
 def upsert_company(
-    conn: sqlite3.Connection,
+    conn: Connection,
     neq: str,
     label: str,
     source: str,
@@ -247,17 +293,27 @@ def upsert_company(
     normalized_label = normalize_text(label or neq)
     updated_at = utc_now_iso()
     conn.execute(
-        """
+        text(
+            """
         INSERT INTO entities (node_id, entity_type, label, normalized_label, neq, source, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (:node_id, :entity_type, :label, :normalized_label, :neq, :source, :updated_at)
         ON CONFLICT(node_id) DO UPDATE SET
             label = excluded.label,
             normalized_label = excluded.normalized_label,
             neq = excluded.neq,
             source = excluded.source,
             updated_at = excluded.updated_at
-        """,
-        (node_id, COMPANY_NODE, label or neq, normalized_label, neq, source, updated_at),
+        """
+        ),
+        {
+            "node_id": node_id,
+            "entity_type": COMPANY_NODE,
+            "label": label or neq,
+            "normalized_label": normalized_label,
+            "neq": neq,
+            "source": source,
+            "updated_at": updated_at,
+        },
     )
     alias_values = set(aliases or [])
     alias_values.add(label or neq)
@@ -266,43 +322,68 @@ def upsert_company(
         if not normalized_alias:
             continue
         conn.execute(
-            """
-            INSERT OR IGNORE INTO entity_aliases (node_id, alias, normalized_alias, source)
-            VALUES (?, ?, ?, ?)
-            """,
-            (node_id, alias, normalized_alias, source),
+            text(
+                """
+                INSERT INTO entity_aliases (node_id, alias, normalized_alias, source)
+                VALUES (:node_id, :alias, :normalized_alias, :source)
+                ON CONFLICT(node_id, normalized_alias) DO NOTHING
+                """
+            ),
+            {
+                "node_id": node_id,
+                "alias": alias,
+                "normalized_alias": normalized_alias,
+                "source": source,
+            },
         )
     return node_id
 
 
-def upsert_person(conn: sqlite3.Connection, name: str, source: str) -> str:
+def upsert_person(conn: Connection, name: str, source: str) -> str:
     node_id = normalize_node_id(PERSON_NODE, name)
     normalized_label = normalize_text(name)
     updated_at = utc_now_iso()
     conn.execute(
-        """
+        text(
+            """
         INSERT INTO entities (node_id, entity_type, label, normalized_label, neq, source, updated_at)
-        VALUES (?, ?, ?, ?, NULL, ?, ?)
+        VALUES (:node_id, :entity_type, :label, :normalized_label, NULL, :source, :updated_at)
         ON CONFLICT(node_id) DO UPDATE SET
             label = excluded.label,
             normalized_label = excluded.normalized_label,
             source = excluded.source,
             updated_at = excluded.updated_at
-        """,
-        (node_id, PERSON_NODE, name, normalized_label, source, updated_at),
+        """
+        ),
+        {
+            "node_id": node_id,
+            "entity_type": PERSON_NODE,
+            "label": name,
+            "normalized_label": normalized_label,
+            "source": source,
+            "updated_at": updated_at,
+        },
     )
     conn.execute(
-        """
-        INSERT OR IGNORE INTO entity_aliases (node_id, alias, normalized_alias, source)
-        VALUES (?, ?, ?, ?)
-        """,
-        (node_id, name, normalized_label, source),
+        text(
+            """
+            INSERT INTO entity_aliases (node_id, alias, normalized_alias, source)
+            VALUES (:node_id, :alias, :normalized_alias, :source)
+            ON CONFLICT(node_id, normalized_alias) DO NOTHING
+            """
+        ),
+        {
+            "node_id": node_id,
+            "alias": name,
+            "normalized_alias": normalized_label,
+            "source": source,
+        },
     )
     return node_id
 
 
 def insert_relation(
-    conn: sqlite3.Connection,
+    conn: Connection,
     source_node_id: str,
     target_node_id: str,
     relation_type: str,
@@ -311,20 +392,23 @@ def insert_relation(
     source_detail: Optional[str] = None,
 ) -> None:
     conn.execute(
-        """
-        INSERT OR IGNORE INTO relations
+        text(
+            """
+        INSERT INTO relations
         (source_node_id, target_node_id, relation_type, relation_label, source_dataset, source_detail, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            source_node_id,
-            target_node_id,
-            relation_type,
-            relation_label,
-            source_dataset,
-            source_detail,
-            utc_now_iso(),
+        VALUES (:source_node_id, :target_node_id, :relation_type, :relation_label, :source_dataset, :source_detail, :updated_at)
+        ON CONFLICT(source_node_id, target_node_id, relation_type, source_dataset, source_detail) DO NOTHING
+        """
         ),
+        {
+            "source_node_id": source_node_id,
+            "target_node_id": target_node_id,
+            "relation_type": relation_type,
+            "relation_label": relation_label,
+            "source_dataset": source_dataset,
+            "source_detail": source_detail,
+            "updated_at": utc_now_iso(),
+        },
     )
 
 
@@ -335,10 +419,10 @@ def ingest_tables(tables: Dict[str, List[Dict[str, str]]]) -> Dict[str, int]:
         "people": 0,
         "relations": 0,
     }
-    with open_db() as conn:
-        conn.execute("DELETE FROM relations")
-        conn.execute("DELETE FROM entity_aliases")
-        conn.execute("DELETE FROM entities")
+    with open_db_tx() as conn:
+        conn.execute(text("DELETE FROM relations"))
+        conn.execute(text("DELETE FROM entity_aliases"))
+        conn.execute(text("DELETE FROM entities"))
 
         company_names: Dict[str, set] = {}
         for filename, rows in tables.items():
@@ -416,18 +500,33 @@ def ingest_tables(tables: Dict[str, List[Dict[str, str]]]) -> Dict[str, int]:
                     )
 
         stats["companies"] = conn.execute(
-            "SELECT COUNT(*) AS total FROM entities WHERE entity_type = ?",
-            (COMPANY_NODE,),
-        ).fetchone()["total"]
+            text("SELECT COUNT(*) AS total FROM entities WHERE entity_type = :entity_type"),
+            {"entity_type": COMPANY_NODE},
+        ).mappings().one()["total"]
         stats["people"] = conn.execute(
-            "SELECT COUNT(*) AS total FROM entities WHERE entity_type = ?",
-            (PERSON_NODE,),
-        ).fetchone()["total"]
-        stats["relations"] = conn.execute("SELECT COUNT(*) AS total FROM relations").fetchone()["total"]
-        conn.execute("REPLACE INTO metadata (key, value) VALUES (?, ?)", ("last_ingest_at", utc_now_iso()))
+            text("SELECT COUNT(*) AS total FROM entities WHERE entity_type = :entity_type"),
+            {"entity_type": PERSON_NODE},
+        ).mappings().one()["total"]
+        stats["relations"] = conn.execute(text("SELECT COUNT(*) AS total FROM relations")).mappings().one()["total"]
         conn.execute(
-            "REPLACE INTO metadata (key, value) VALUES (?, ?)",
-            ("last_table_count", str(relation_files)),
+            text(
+                """
+                INSERT INTO metadata (key, value)
+                VALUES (:key, :value)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """
+            ),
+            {"key": "last_ingest_at", "value": utc_now_iso()},
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO metadata (key, value)
+                VALUES (:key, :value)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """
+            ),
+            {"key": "last_table_count", "value": str(relation_files)},
         )
     return stats
 
@@ -532,21 +631,24 @@ def start_sync_in_background(force: bool = False) -> bool:
 
 def get_metadata_value(key: str) -> Optional[str]:
     with open_db() as conn:
-        row = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
+        row = conn.execute(
+            text("SELECT value FROM metadata WHERE key = :key"),
+            {"key": key},
+        ).mappings().first()
     return row["value"] if row else None
 
 
 def get_summary() -> Dict[str, object]:
     with open_db() as conn:
         company_total = conn.execute(
-            "SELECT COUNT(*) AS total FROM entities WHERE entity_type = ?",
-            (COMPANY_NODE,),
-        ).fetchone()["total"]
+            text("SELECT COUNT(*) AS total FROM entities WHERE entity_type = :entity_type"),
+            {"entity_type": COMPANY_NODE},
+        ).mappings().one()["total"]
         person_total = conn.execute(
-            "SELECT COUNT(*) AS total FROM entities WHERE entity_type = ?",
-            (PERSON_NODE,),
-        ).fetchone()["total"]
-        relation_total = conn.execute("SELECT COUNT(*) AS total FROM relations").fetchone()["total"]
+            text("SELECT COUNT(*) AS total FROM entities WHERE entity_type = :entity_type"),
+            {"entity_type": PERSON_NODE},
+        ).mappings().one()["total"]
+        relation_total = conn.execute(text("SELECT COUNT(*) AS total FROM relations")).mappings().one()["total"]
 
     return {
         "companies": company_total,
@@ -568,7 +670,8 @@ def search_entities(query: str) -> List[Dict[str, str]]:
 
     with open_db() as conn:
         rows = conn.execute(
-            """
+            text(
+                """
             SELECT
                 e.node_id,
                 e.entity_type,
@@ -577,17 +680,22 @@ def search_entities(query: str) -> List[Dict[str, str]]:
                 MIN(a.alias) AS matched_alias
             FROM entity_aliases a
             JOIN entities e ON e.node_id = a.node_id
-            WHERE a.normalized_alias LIKE ?
-               OR (e.neq IS NOT NULL AND e.neq LIKE ?)
+            WHERE a.normalized_alias LIKE :normalized_query
+               OR (e.neq IS NOT NULL AND e.neq LIKE :raw_query)
             GROUP BY e.node_id, e.entity_type, e.label, e.neq
             ORDER BY
                 CASE WHEN e.entity_type = 'company' THEN 0 ELSE 1 END,
                 LENGTH(e.label),
                 e.label
-            LIMIT ?
-            """,
-            (f"%{needle}%", f"%{query.strip()}%", MAX_SEARCH_RESULTS),
-        ).fetchall()
+            LIMIT :limit
+            """
+            ),
+            {
+                "normalized_query": f"%{needle}%",
+                "raw_query": f"%{query.strip()}%",
+                "limit": MAX_SEARCH_RESULTS,
+            },
+        ).mappings().all()
 
     return [
         {
@@ -605,16 +713,21 @@ def fetch_graph(node_id: str) -> Dict[str, List[Dict[str, object]]]:
     with open_db() as conn:
         nodes = {}
         relations = conn.execute(
-            """
+            text(
+                """
             SELECT *
             FROM relations
-            WHERE source_node_id = ? OR target_node_id = ?
-            LIMIT ?
-            """,
-            (node_id, node_id, MAX_GRAPH_EDGES),
-        ).fetchall()
+            WHERE source_node_id = :node_id OR target_node_id = :node_id
+            LIMIT :limit
+            """
+            ),
+            {"node_id": node_id, "limit": MAX_GRAPH_EDGES},
+        ).mappings().all()
         if not relations:
-            entity = conn.execute("SELECT * FROM entities WHERE node_id = ?", (node_id,)).fetchone()
+            entity = conn.execute(
+                text("SELECT * FROM entities WHERE node_id = :node_id"),
+                {"node_id": node_id},
+            ).mappings().first()
             if not entity:
                 return {"nodes": [], "links": []}
             return {
@@ -644,11 +757,12 @@ def fetch_graph(node_id: str) -> Dict[str, List[Dict[str, object]]]:
                 }
             )
 
-        placeholders = ",".join("?" for _ in related_ids)
         entity_rows = conn.execute(
-            f"SELECT * FROM entities WHERE node_id IN ({placeholders})",
-            tuple(related_ids),
-        ).fetchall()
+            text("SELECT * FROM entities WHERE node_id IN :node_ids").bindparams(
+                bindparam("node_ids", expanding=True)
+            ),
+            {"node_ids": list(related_ids)},
+        ).mappings().all()
         for entity in entity_rows:
             nodes[entity["node_id"]] = {
                 "id": entity["node_id"],
@@ -765,7 +879,8 @@ def main() -> None:
     app.run(debug=debug, host="0.0.0.0", port=port)
 
 
-bootstrap()
+if not APP_SKIP_BOOTSTRAP:
+    bootstrap()
 
 
 if __name__ == "__main__":

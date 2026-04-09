@@ -1,10 +1,12 @@
 import csv
 import io
+import os
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
 
+os.environ["APP_SKIP_BOOTSTRAP"] = "1"
 import app as app_module
 
 
@@ -20,16 +22,20 @@ class ReqAppTestCase(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
         tmp_path = Path(self.tmpdir.name)
+        app_module.DATABASE_URL = ""
         app_module.DATA_DIR = tmp_path
         app_module.DATA_ZIP_PATH = tmp_path / "req-dataset.zip"
         app_module.DB_PATH = tmp_path / "req_cache.sqlite3"
+        app_module.reset_engine()
         app_module.sync_state.update(
             {
                 "is_running": False,
+                "phase": "idle",
                 "last_started_at": None,
                 "last_completed_at": None,
                 "last_success_at": None,
                 "last_error": None,
+                "last_result": None,
             }
         )
         app_module.init_db()

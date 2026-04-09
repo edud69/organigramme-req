@@ -5,7 +5,7 @@ Application Flask pour rechercher les entreprises du Québec et visualiser leurs
 ## Ce que le projet fait maintenant
 
 - Télécharge automatiquement la dernière archive ZIP du REQ depuis Données Québec.
-- Indexe les CSV dans une base SQLite locale pour rendre la recherche rapide.
+- Indexe les CSV dans une base persistante via `DATABASE_URL` quand elle est disponible.
 - Affiche un graphe visuel des relations directes entre entités juridiques trouvées dans les fichiers REQ.
 - Expose un endpoint de sync manuel `POST /api/sync`.
 - Lance un sync automatique toutes les 24 heures tant que le service reste actif.
@@ -55,8 +55,10 @@ Par défaut, `POST /api/sync` lance le sync en arrière-plan et répond tout de 
 - `MAX_SEARCH_RESULTS` : taille de la liste de résultats, par défaut `20`
 - `MAX_GRAPH_EDGES` : limite de liens par vue graphe, par défaut `250`
 - `ADMIN_SYNC_TOKEN` : jeton simple pour protéger `POST /api/sync`
+- `DATABASE_URL` : base de données persistante. Recommandé en production, notamment avec Render Postgres
 - `REQ_CKAN_PACKAGE_URL` : surcharge de l'URL CKAN si nécessaire
 - `REQ_DATASET_ZIP_URL` : URL ZIP directe à utiliser si l'API CKAN renvoie `403`
+- `REQ_DATA_DIR` : dossier local temporaire pour l'archive ZIP, par défaut `/tmp/organigramme-req` quand `DATABASE_URL` est défini
 
 ## Déploiement
 
@@ -68,8 +70,10 @@ Le repo inclut :
 ## Workflow conseillé
 
 1. Déployer l'app web.
-2. Définir `ADMIN_SYNC_TOKEN` sur l'hébergeur.
-3. Si Données Québec bloque l’API CKAN côté serveur, définir aussi `REQ_DATASET_ZIP_URL`.
-4. Mettre en place un cron côté hébergeur ou laisser l’auto-sync interne tourner toutes les 24 heures.
+2. Créer une base Postgres Render gratuite.
+3. Définir `DATABASE_URL` sur le web service avec l'URL interne de cette base.
+4. Définir `ADMIN_SYNC_TOKEN` sur l'hébergeur.
+5. Si Données Québec bloque l’API CKAN côté serveur, définir aussi `REQ_DATASET_ZIP_URL`.
+6. Utiliser GitHub Actions pour appeler `POST /api/sync` chaque nuit.
 
 Cette approche est robuste pour le refresh du dataset ouvert. Pour les personnes physiques, il faudra décider de la source d’enrichissement avant de promettre un graphe complet entreprise/personne à l’échelle du Québec.
