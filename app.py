@@ -3,6 +3,7 @@ import datetime as dt
 import hashlib
 import io
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -37,13 +38,17 @@ COMPANY_NODE = "company"
 PERSON_NODE = "person"
 
 app = Flask(__name__)
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("organigramme-req")
 data_lock = threading.Lock()
 sync_state = {
     "is_running": False,
+    "phase": "idle",
     "last_started_at": None,
     "last_completed_at": None,
     "last_success_at": None,
     "last_error": None,
+    "last_result": None,
 }
 sync_thread: Optional[threading.Thread] = None
 
@@ -429,12 +434,15 @@ def ingest_tables(tables: Dict[str, List[Dict[str, str]]]) -> Dict[str, int]:
 
 def sync_dataset(force: bool = False) -> Dict[str, object]:
     with data_lock:
+        logger.info("REQ sync started force=%s", force)
         sync_state["is_running"] = True
+        sync_state["phase"] = "starting"
         sync_state["last_started_at"] = local_now_iso()
         sync_state["last_error"] = None
 
         try:
             ensure_data_dir()
+            sync_state["phase"] = "fetching_metadata"
             metadata = fetch_metadata()
             zip_resource = find_zip_resource(metadata or {})
 
@@ -461,16 +469,20 @@ def sync_dataset(force: bool = False) -> Dict[str, object]:
                 should_download = True
 
             if should_download:
+                sync_state["phase"] = "downloading_archive"
                 url = zip_resource.get("url")
                 if not url:
                     raise RuntimeError("La ressource ZIP ne contient pas d'URL téléchargeable.")
+                logger.info("REQ sync downloading archive from %s", url)
                 if not download_file(url, DATA_ZIP_PATH):
                     raise RuntimeError("Le téléchargement du jeu de données a échoué.")
 
+            sync_state["phase"] = "reading_archive"
             tables = read_archive_tables(DATA_ZIP_PATH)
             if not tables:
                 raise RuntimeError("Aucun fichier CSV exploitable n'a été trouvé dans l'archive.")
 
+            sync_state["phase"] = "ingesting"
             stats = ingest_tables(tables)
             result = {
                 "downloaded": should_download,
@@ -482,10 +494,15 @@ def sync_dataset(force: bool = False) -> Dict[str, object]:
                     "sans source complémentaire autorisée."
                 ),
             }
+            sync_state["phase"] = "completed"
+            sync_state["last_result"] = result
             sync_state["last_success_at"] = local_now_iso()
+            logger.info("REQ sync completed: %s", result)
             return result
         except Exception as exc:
             sync_state["last_error"] = str(exc)
+            sync_state["phase"] = "failed"
+            logger.exception("REQ sync failed")
             raise
         finally:
             sync_state["is_running"] = False
@@ -502,7 +519,7 @@ def start_sync_in_background(force: bool = False) -> bool:
         try:
             sync_dataset(force=force)
         except Exception:
-            pass
+            logger.exception("Background sync crashed")
 
     sync_thread = threading.Thread(
         target=_runner,
