@@ -44,6 +44,8 @@ curl -X POST http://localhost:5000/api/sync
 
 Si `ADMIN_SYNC_TOKEN` est défini, ajoute l'en-tête `X-Admin-Sync-Token`.
 
+Par défaut, `POST /api/sync` lance le sync en arrière-plan et répond tout de suite. Pour attendre la fin côté client, ajoute `?wait=1`.
+
 ## Variables d'environnement
 
 - `PORT` : port HTTP, par défaut `5000`

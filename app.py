@@ -45,6 +45,7 @@ sync_state = {
     "last_success_at": None,
     "last_error": None,
 }
+sync_thread: Optional[threading.Thread] = None
 
 
 def ensure_data_dir() -> None:
@@ -491,6 +492,27 @@ def sync_dataset(force: bool = False) -> Dict[str, object]:
             sync_state["last_completed_at"] = local_now_iso()
 
 
+def start_sync_in_background(force: bool = False) -> bool:
+    global sync_thread
+
+    if sync_state["is_running"] and sync_thread and sync_thread.is_alive():
+        return False
+
+    def _runner() -> None:
+        try:
+            sync_dataset(force=force)
+        except Exception:
+            pass
+
+    sync_thread = threading.Thread(
+        target=_runner,
+        daemon=True,
+        name=f"manual-sync-{'force' if force else 'normal'}",
+    )
+    sync_thread.start()
+    return True
+
+
 def get_metadata_value(key: str) -> Optional[str]:
     with open_db() as conn:
         row = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
@@ -676,11 +698,27 @@ def api_sync():
         if not check_admin_token(request):
             return jsonify({"error": "Unauthorized"}), 401
         force = request.args.get("force", "0") == "1"
-        try:
-            result = sync_dataset(force=force)
-            return jsonify({"ok": True, **result})
-        except Exception as exc:
-            return jsonify({"ok": False, "error": str(exc), "sync": dict(sync_state)}), 500
+        wait_for_completion = request.args.get("wait", "0") == "1"
+        if wait_for_completion:
+            try:
+                result = sync_dataset(force=force)
+                return jsonify({"ok": True, "mode": "sync", **result})
+            except Exception as exc:
+                return jsonify({"ok": False, "error": str(exc), "sync": dict(sync_state)}), 500
+
+        started = start_sync_in_background(force=force)
+        status_code = 202 if started else 200
+        return (
+            jsonify(
+                {
+                    "ok": True,
+                    "mode": "async",
+                    "started": started,
+                    "sync": dict(sync_state),
+                }
+            ),
+            status_code,
+        )
     return jsonify({"ok": True, "sync": dict(sync_state), "summary": get_summary()})
 
 
