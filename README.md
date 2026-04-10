@@ -104,19 +104,30 @@ Fichiers fournis :
 2. Y mettre au minimum :
    - `DATABASE_URL`
    - `REQ_DATASET_ZIP_URL`
-3. Rendre le script exécutable :
+   - `REQ_DOWNLOAD_MODE=browser`
+3. Installer les dépendances Python et Playwright :
+
+```bash
+cd /Users/matt/Documents/Codex/organigramme-req
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python -m playwright install chrome
+```
+
+4. Rendre le script exécutable :
 
 ```bash
 chmod +x /Users/matt/Documents/Codex/organigramme-req/scripts/run_req_sync.sh
 ```
 
-4. Créer le dossier de logs :
+5. Créer le dossier de logs :
 
 ```bash
 mkdir -p /Users/matt/Documents/Codex/organigramme-req/logs
 ```
 
-5. Installer le job `launchd` :
+6. Installer le job `launchd` :
 
 ```bash
 cp /Users/matt/Documents/Codex/organigramme-req/launchd/com.organigramme.req-sync.plist ~/Library/LaunchAgents/
@@ -124,16 +135,22 @@ launchctl unload ~/Library/LaunchAgents/com.organigramme.req-sync.plist 2>/dev/n
 launchctl load ~/Library/LaunchAgents/com.organigramme.req-sync.plist
 ```
 
-6. Lancer un test manuel :
+7. Lancer un test manuel :
 
 ```bash
 launchctl start com.organigramme.req-sync
 ```
 
-7. Consulter les logs :
+8. Consulter les logs :
 
 ```bash
 tail -f /Users/matt/Documents/Codex/organigramme-req/logs/req-sync.log
 ```
 
 Le job est configuré pour tourner tous les jours à `03:15` heure locale. Tu peux changer l'heure dans le fichier plist.
+
+Notes :
+
+- `REQ_DOWNLOAD_MODE=browser` force l’usage d’un vrai navigateur piloté par Playwright.
+- `REQ_BROWSER_HEADLESS=0` garde le navigateur visible, ce qui se rapproche davantage d’un usage humain.
+- si Chrome n'est pas installé, tu peux utiliser Chromium via `python -m playwright install chromium` et vider `REQ_BROWSER_CHANNEL`.

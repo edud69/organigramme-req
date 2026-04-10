@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+import shutil
 import threading
 import time
 import urllib.request
@@ -31,6 +32,13 @@ CKAN_PACKAGE_URL = os.environ.get(
     "?id=6f710997-b5f9-4347-893b-1a47ddb61437",
 )
 REQ_DATASET_ZIP_URL = os.environ.get("REQ_DATASET_ZIP_URL", "").strip()
+REQ_DOWNLOAD_MODE = os.environ.get("REQ_DOWNLOAD_MODE", "http").strip().lower()
+REQ_BROWSER_HEADLESS = os.environ.get("REQ_BROWSER_HEADLESS", "0") == "1"
+REQ_BROWSER_CHANNEL = os.environ.get("REQ_BROWSER_CHANNEL", "chrome").strip() or None
+REQ_BROWSER_PRIME_URL = os.environ.get(
+    "REQ_BROWSER_PRIME_URL",
+    "https://www.donneesquebec.ca/recherche/dataset/registre-des-entreprises",
+).strip()
 UPDATE_INTERVAL_SECONDS = int(os.environ.get("UPDATE_INTERVAL_SECONDS", str(24 * 3600)))
 AUTO_SYNC_ENABLED = os.environ.get("AUTO_SYNC_ENABLED", "1") == "1"
 MAX_SEARCH_RESULTS = int(os.environ.get("MAX_SEARCH_RESULTS", "20"))
@@ -226,6 +234,9 @@ def parse_remote_date(date_str: str) -> Optional[dt.datetime]:
 
 
 def download_file(url: str, dest: Path) -> bool:
+    if REQ_DOWNLOAD_MODE == "browser":
+        return download_file_with_browser(url, dest)
+
     tmp_path = dest.with_suffix(dest.suffix + ".tmp")
     try:
         req = urllib.request.Request(
@@ -254,6 +265,75 @@ def download_file(url: str, dest: Path) -> bool:
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
         return False
+
+
+def download_file_with_browser(url: str, dest: Path) -> bool:
+    tmp_path = dest.with_suffix(dest.suffix + ".tmp")
+    browser_profile_dir = DATA_DIR / "browser-profile"
+    ensure_data_dir()
+    browser_profile_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        logger.exception("Playwright is not installed or not available")
+        return False
+
+    try:
+        with sync_playwright() as p:
+            browser_launcher = p.chromium
+            launch_kwargs = {
+                "headless": REQ_BROWSER_HEADLESS,
+                "accept_downloads": True,
+                "user_agent": HTTP_USER_AGENT,
+            }
+            if REQ_BROWSER_CHANNEL:
+                launch_kwargs["channel"] = REQ_BROWSER_CHANNEL
+
+            context = browser_launcher.launch_persistent_context(
+                str(browser_profile_dir),
+                **launch_kwargs,
+            )
+            try:
+                page = context.new_page()
+                page.set_default_timeout(SYNC_TIMEOUT_SECONDS * 1000)
+                page.set_extra_http_headers(
+                    {
+                        "Accept": "*/*",
+                        "Upgrade-Insecure-Requests": "1",
+                    }
+                )
+
+                if REQ_BROWSER_PRIME_URL:
+                    logger.info("REQ browser priming on %s", REQ_BROWSER_PRIME_URL)
+                    page.goto(REQ_BROWSER_PRIME_URL, wait_until="domcontentloaded")
+                    page.wait_for_timeout(1500)
+
+                logger.info("REQ browser downloading archive from %s", url)
+                with page.expect_download(timeout=SYNC_TIMEOUT_SECONDS * 1000) as download_info:
+                    page.goto(url, wait_until="domcontentloaded")
+
+                download = download_info.value
+                logger.info("REQ browser download suggested filename=%s", download.suggested_filename)
+                download.save_as(str(tmp_path))
+            finally:
+                context.close()
+
+        if not tmp_path.exists() or tmp_path.stat().st_size == 0:
+            logger.error("REQ browser download created no usable file")
+            tmp_path.unlink(missing_ok=True)
+            return False
+
+        shutil.move(str(tmp_path), str(dest))
+        return True
+    except PlaywrightTimeoutError:
+        logger.exception("REQ browser download timed out")
+    except Exception:
+        logger.exception("REQ browser download failed for %s", url)
+
+    tmp_path.unlink(missing_ok=True)
+    return False
 
 
 def read_archive_tables(zip_path: Path) -> Dict[str, List[Dict[str, str]]]:
