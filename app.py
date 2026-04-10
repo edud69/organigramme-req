@@ -10,6 +10,7 @@ import threading
 import time
 import urllib.request
 import zipfile
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
@@ -164,6 +165,8 @@ def init_db() -> None:
                 """
             )
         )
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_entities_neq ON entities(neq)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_entities_normalized_label ON entities(normalized_label)"))
         conn.execute(
             text(
                 f"""
@@ -178,8 +181,7 @@ def init_db() -> None:
                 """
             )
         )
-        if use_optional_indexes:
-            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_entity_aliases_normalized ON entity_aliases(normalized_alias)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_entity_aliases_normalized ON entity_aliases(normalized_alias)"))
         conn.execute(
             text(
                 f"""
@@ -441,6 +443,10 @@ def dataset_label_from_filename(filename: str) -> str:
     return label or filename
 
 
+def prefix_upper_bound(value: str) -> str:
+    return f"{value}\uffff"
+
+
 def relation_label_from_code(code: str, filename: str) -> str:
     normalized = (code or "").strip().upper()
     mapping = {
@@ -452,6 +458,20 @@ def relation_label_from_code(code: str, filename: str) -> str:
         "SC": "Scission",
     }
     return mapping.get(normalized, dataset_label_from_filename(filename))
+
+
+def dedupe_search_rows(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    seen_ids = set()
+    results = []
+    for row in rows:
+        node_id = row["id"]
+        if node_id in seen_ids:
+            continue
+        seen_ids.add(node_id)
+        results.append(row)
+        if len(results) >= MAX_SEARCH_RESULTS:
+            break
+    return results
 
 
 def upsert_company(
@@ -880,6 +900,7 @@ def sync_dataset(force: bool = False) -> Dict[str, object]:
 
             sync_state["phase"] = "ingesting"
             stats = ingest_archive(DATA_ZIP_PATH)
+            search_entities.cache_clear()
             result = {
                 "downloaded": should_download,
                 "remote_last_modified": zip_resource.get("last_modified"),
@@ -960,50 +981,145 @@ def get_summary() -> Dict[str, object]:
     }
 
 
+@lru_cache(maxsize=2048)
 def search_entities(query: str) -> List[Dict[str, str]]:
     needle = normalize_text(query)
-    if not needle:
+    raw_query = query.strip()
+    if not needle or len(needle) < 2:
         return []
 
-    with open_db() as conn:
-        rows = conn.execute(
-            text(
-                """
-            SELECT
-                e.node_id,
-                e.entity_type,
-                e.label,
-                e.neq,
-                MIN(a.alias) AS matched_alias
-            FROM entity_aliases a
-            JOIN entities e ON e.node_id = a.node_id
-            WHERE a.normalized_alias LIKE :normalized_query
-               OR (e.neq IS NOT NULL AND e.neq LIKE :raw_query)
-            GROUP BY e.node_id, e.entity_type, e.label, e.neq
-            ORDER BY
-                CASE WHEN e.entity_type = 'company' THEN 0 ELSE 1 END,
-                LENGTH(e.label),
-                e.label
-            LIMIT :limit
-            """
-            ),
-            {
-                "normalized_query": f"%{needle}%",
-                "raw_query": f"%{query.strip()}%",
-                "limit": MAX_SEARCH_RESULTS,
-            },
-        ).mappings().all()
+    prefix_start = needle
+    prefix_end = prefix_upper_bound(needle)
+    results: List[Dict[str, str]] = []
 
-    return [
-        {
-            "id": row["node_id"],
-            "type": row["entity_type"],
-            "label": row["label"],
-            "neq": row["neq"] or "",
-            "matched_alias": row["matched_alias"] or row["label"],
-        }
-        for row in rows
-    ]
+    with open_db() as conn:
+        if raw_query.isdigit():
+            neq_rows = conn.execute(
+                text(
+                    """
+                    SELECT node_id, entity_type, label, neq, label AS matched_alias
+                    FROM entities
+                    WHERE neq = :exact_neq OR (neq IS NOT NULL AND neq LIKE :prefix_neq)
+                    ORDER BY CASE WHEN neq = :exact_neq THEN 0 ELSE 1 END, neq
+                    LIMIT :limit
+                    """
+                ),
+                {
+                    "exact_neq": raw_query,
+                    "prefix_neq": f"{raw_query}%",
+                    "limit": MAX_SEARCH_RESULTS,
+                },
+            ).mappings().all()
+            results.extend(
+                {
+                    "id": row["node_id"],
+                    "type": row["entity_type"],
+                    "label": row["label"],
+                    "neq": row["neq"] or "",
+                    "matched_alias": row["matched_alias"] or row["label"],
+                }
+                for row in neq_rows
+            )
+
+        if len(results) < MAX_SEARCH_RESULTS:
+            entity_rows = conn.execute(
+                text(
+                    """
+                    SELECT node_id, entity_type, label, neq, label AS matched_alias
+                    FROM entities
+                    WHERE normalized_label >= :prefix_start
+                      AND normalized_label < :prefix_end
+                    ORDER BY LENGTH(label), label
+                    LIMIT :limit
+                    """
+                ),
+                {
+                    "prefix_start": prefix_start,
+                    "prefix_end": prefix_end,
+                    "limit": MAX_SEARCH_RESULTS,
+                },
+            ).mappings().all()
+            results.extend(
+                {
+                    "id": row["node_id"],
+                    "type": row["entity_type"],
+                    "label": row["label"],
+                    "neq": row["neq"] or "",
+                    "matched_alias": row["matched_alias"] or row["label"],
+                }
+                for row in entity_rows
+            )
+
+        deduped = dedupe_search_rows(results)
+        if len(deduped) < MAX_SEARCH_RESULTS:
+            alias_rows = conn.execute(
+                text(
+                    """
+                    SELECT
+                        e.node_id,
+                        e.entity_type,
+                        e.label,
+                        e.neq,
+                        a.alias AS matched_alias
+                    FROM entity_aliases a
+                    JOIN entities e ON e.node_id = a.node_id
+                    WHERE a.normalized_alias >= :prefix_start
+                      AND a.normalized_alias < :prefix_end
+                    ORDER BY LENGTH(a.alias), a.alias
+                    LIMIT :limit
+                    """
+                ),
+                {
+                    "prefix_start": prefix_start,
+                    "prefix_end": prefix_end,
+                    "limit": MAX_SEARCH_RESULTS,
+                },
+            ).mappings().all()
+            deduped = dedupe_search_rows(
+                deduped
+                + [
+                    {
+                        "id": row["node_id"],
+                        "type": row["entity_type"],
+                        "label": row["label"],
+                        "neq": row["neq"] or "",
+                        "matched_alias": row["matched_alias"] or row["label"],
+                    }
+                    for row in alias_rows
+                ]
+            )
+
+        if len(deduped) < MAX_SEARCH_RESULTS and len(needle) >= 4:
+            contains_rows = conn.execute(
+                text(
+                    """
+                    SELECT node_id, entity_type, label, neq, label AS matched_alias
+                    FROM entities
+                    WHERE normalized_label LIKE :contains_query
+                    ORDER BY LENGTH(label), label
+                    LIMIT :limit
+                    """
+                ),
+                {
+                    "contains_query": f"%{needle}%",
+                    "limit": MAX_SEARCH_RESULTS,
+                },
+            ).mappings().all()
+            deduped = dedupe_search_rows(
+                deduped
+                + [
+                    {
+                        "id": row["node_id"],
+                        "type": row["entity_type"],
+                        "label": row["label"],
+                        "neq": row["neq"] or "",
+                        "matched_alias": row["matched_alias"] or row["label"],
+                    }
+                    for row in contains_rows
+                ]
+            )
+
+    return deduped
 
 
 def fetch_graph(node_id: str) -> Dict[str, List[Dict[str, object]]]:

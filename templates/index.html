@@ -373,7 +373,7 @@
       }
 
       async function performSearch(query) {
-        if (!query) {
+        if (!query || query.length < 2) {
           searchResults.innerHTML = '';
           return;
         }
@@ -508,14 +508,7 @@
 
       searchInput.addEventListener('input', () => {
         clearTimeout(timeoutId);
-        timeoutId = setTimeout(() => performSearch(searchInput.value.trim()), 220);
-      });
-
-      window.addEventListener('resize', () => {
-        const current = searchInput.value.trim();
-        if (current) {
-          performSearch(current);
-        }
+        timeoutId = setTimeout(() => performSearch(searchInput.value.trim()), 380);
       });
 
       refreshSummary();
