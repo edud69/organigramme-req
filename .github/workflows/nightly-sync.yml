@@ -9,9 +9,21 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Trigger deployed sync
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run REQ sync into Postgres
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          REQ_DATASET_ZIP_URL: ${{ secrets.REQ_DATASET_ZIP_URL }}
+          AUTO_SYNC_ENABLED: "0"
         run: |
-          curl --fail --show-error --silent \
-            -X POST \
-            -H "X-Admin-Sync-Token: ${{ secrets.SYNC_TOKEN }}" \
-            "${{ secrets.SYNC_URL }}?force=1"
+          python app.py sync

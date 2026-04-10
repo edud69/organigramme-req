@@ -66,14 +66,24 @@ Le repo inclut :
 
 - un `Procfile` pour lancer `gunicorn`
 - un `render.yaml` pour préparer un déploiement Render
+- un workflow GitHub Actions pour exécuter le sync directement dans Supabase/Postgres
 
 ## Workflow conseillé
 
 1. Déployer l'app web.
-2. Créer une base Postgres Render gratuite.
-3. Définir `DATABASE_URL` sur le web service avec l'URL interne de cette base.
-4. Définir `ADMIN_SYNC_TOKEN` sur l'hébergeur.
-5. Si Données Québec bloque l’API CKAN côté serveur, définir aussi `REQ_DATASET_ZIP_URL`.
-6. Utiliser GitHub Actions pour appeler `POST /api/sync` chaque nuit.
+2. Créer une base Postgres persistante, par exemple Supabase.
+3. Définir `DATABASE_URL` sur le web service avec la chaîne de connexion de cette base.
+4. Définir `ADMIN_SYNC_TOKEN` sur l'hébergeur si tu veux garder le endpoint `/api/sync` pour debug manuel.
+5. Définir `REQ_DATASET_ZIP_URL`.
+6. Utiliser GitHub Actions pour exécuter `python app.py sync` chaque nuit directement vers Postgres.
 
 Cette approche est robuste pour le refresh du dataset ouvert. Pour les personnes physiques, il faudra décider de la source d’enrichissement avant de promettre un graphe complet entreprise/personne à l’échelle du Québec.
+
+## GitHub Actions
+
+Le workflow nocturne n'appelle plus Render. Il exécute directement le job d'ingestion et écrit dans `DATABASE_URL`.
+
+Secrets GitHub à définir :
+
+- `DATABASE_URL` : chaîne Postgres Supabase ou autre base persistante
+- `REQ_DATASET_ZIP_URL` : URL directe du ZIP REQ
