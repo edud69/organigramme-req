@@ -12,7 +12,12 @@ import app as app_module
 
 def write_csv(rows):
     buffer = io.StringIO()
-    writer = csv.DictWriter(buffer, fieldnames=list(rows[0].keys()))
+    fieldnames = []
+    for row in rows:
+        for key in row.keys():
+            if key not in fieldnames:
+                fieldnames.append(key)
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames)
     writer.writeheader()
     writer.writerows(rows)
     return buffer.getvalue()
@@ -56,6 +61,7 @@ class ReqAppTestCase(unittest.TestCase):
                     [
                         {"NEQ_ASSUJ_REL": "111", "NEQ": "222", "COD_RELA_ASSUJ": "FUS"},
                         {"NEQ_ASSUJ_REL": "111", "NEQ": "333", "COD_RELA_ASSUJ": "SCI"},
+                        {"NEQ_ASSUJ_REL": "", "NEQ": "333", "DENOMN_SOC": "Holding Delta inc.", "COD_RELA_ASSUJ": "FO"},
                     ]
                 ),
             )
@@ -79,13 +85,21 @@ class ReqAppTestCase(unittest.TestCase):
         self.assertEqual(len(payload["nodes"]), 3)
         self.assertEqual(len(payload["links"]), 2)
 
+    def test_network_includes_named_company_relation_without_related_neq(self):
+        response = self.client.get("/api/network?neq=333")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        labels = {node["label"] for node in payload["nodes"]}
+        self.assertIn("Holding Delta inc.", labels)
+        self.assertGreaterEqual(len(payload["links"]), 2)
+
     def test_summary_has_counts(self):
         response = self.client.get("/api/summary")
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
-        self.assertEqual(payload["companies"], 3)
+        self.assertEqual(payload["companies"], 4)
         self.assertEqual(payload["people"], 0)
-        self.assertEqual(payload["relations"], 2)
+        self.assertEqual(payload["relations"], 3)
 
     def test_parse_public_registry_relations_supports_people_and_companies(self):
         relations = app_module.parse_public_registry_relations(

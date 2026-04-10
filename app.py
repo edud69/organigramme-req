@@ -260,6 +260,11 @@ def normalize_node_id(entity_type: str, raw_value: str) -> str:
     return f"{entity_type}:{digest}"
 
 
+def normalize_company_label_node_id(label: str) -> str:
+    digest = hashlib.sha1(normalize_text(label).encode("utf-8")).hexdigest()[:16]
+    return f"company-name:{digest}"
+
+
 def looks_like_company(label: str) -> bool:
     value = normalize_text(label)
     company_markers = (
@@ -613,6 +618,44 @@ def ensure_company_entity(conn: Connection, neq: str, label: str, source: str = 
     return node_id
 
 
+def ensure_company_label_entity(conn: Connection, label: str, source: str = REQ_OPEN_DATA_SOURCE) -> str:
+    node_id = normalize_company_label_node_id(label)
+    normalized_label = normalize_text(label)
+    conn.execute(
+        text(
+            """
+            INSERT INTO entities (node_id, entity_type, label, normalized_label, neq, source, updated_at)
+            VALUES (:node_id, :entity_type, :label, :normalized_label, NULL, :source, :updated_at)
+            ON CONFLICT(node_id) DO NOTHING
+            """
+        ),
+        {
+            "node_id": node_id,
+            "entity_type": COMPANY_NODE,
+            "label": label,
+            "normalized_label": normalized_label,
+            "source": source,
+            "updated_at": utc_now_iso(),
+        },
+    )
+    conn.execute(
+        text(
+            """
+            INSERT INTO entity_aliases (node_id, alias, normalized_alias, source)
+            VALUES (:node_id, :alias, :normalized_alias, :source)
+            ON CONFLICT(node_id, normalized_alias) DO NOTHING
+            """
+        ),
+        {
+            "node_id": node_id,
+            "alias": label,
+            "normalized_alias": normalized_label,
+            "source": source,
+        },
+    )
+    return node_id
+
+
 def upsert_company_enrichment_status(
     conn: Connection,
     neq: str,
@@ -804,6 +847,7 @@ def ingest_archive(zip_path: Path) -> Dict[str, int]:
     }
     now = utc_now_iso()
     company_names: Dict[str, set] = {}
+    named_companies: Dict[str, str] = {}
     seen_files = set()
     for filename, row in iter_archive_rows(zip_path, {"nom.csv"}):
         seen_files.add(filename)
@@ -824,6 +868,14 @@ def ingest_archive(zip_path: Path) -> Dict[str, int]:
         }
         label = choose_company_name(row) or neq
         company_names.setdefault(neq, set()).update(aliases or {label})
+
+    for filename, row in iter_archive_rows(zip_path):
+        seen_files.add(filename)
+        if "NEQ" in row and "NEQ_ASSUJ_REL" in row:
+            related_neq = row.get("NEQ_ASSUJ_REL", "").strip()
+            related_name = row.get("DENOMN_SOC", "").strip()
+            if not related_neq and related_name:
+                named_companies[normalize_company_label_node_id(related_name)] = related_name
 
     stats["tables"] = len(seen_files)
     logger.info("REQ ingest company_names=%s", len(company_names))
@@ -887,6 +939,31 @@ def ingest_archive(zip_path: Path) -> Dict[str, int]:
                 entity_batch,
             )
             inserted_entities += len(entity_batch)
+        if named_companies:
+            named_company_batch = [
+                {
+                    "node_id": node_id,
+                    "entity_type": COMPANY_NODE,
+                    "label": label,
+                    "normalized_label": normalize_text(label),
+                    "neq": None,
+                    "source": REQ_OPEN_DATA_SOURCE,
+                    "updated_at": now,
+                }
+                for node_id, label in named_companies.items()
+            ]
+            for batch in chunked(named_company_batch, ENTITY_BATCH_SIZE):
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO entities (node_id, entity_type, label, normalized_label, neq, source, updated_at)
+                        VALUES (:node_id, :entity_type, :label, :normalized_label, :neq, :source, :updated_at)
+                        ON CONFLICT(node_id) DO NOTHING
+                        """
+                    ),
+                    batch,
+                )
+                inserted_entities += len(batch)
         conn.commit()
         logger.info("REQ ingest inserted_entities=%s", inserted_entities)
 
@@ -897,14 +974,21 @@ def ingest_archive(zip_path: Path) -> Dict[str, int]:
         inserted_relations = 0
         for filename, row in iter_archive_rows(zip_path):
             seen_files.add(filename)
-            if "NEQ" in row and "NEQ_ASSUJ_REL" in row and row.get("NEQ", "").strip() and row.get("NEQ_ASSUJ_REL", "").strip():
+            if "NEQ" in row and "NEQ_ASSUJ_REL" in row and row.get("NEQ", "").strip():
                 relation_files.add(filename)
                 src_neq = row.get("NEQ_ASSUJ_REL", "").strip()
+                src_name = row.get("DENOMN_SOC", "").strip()
                 dst_neq = row.get("NEQ", "").strip()
+                if not src_neq and not src_name:
+                    continue
                 direct_relations += 1
                 relation_code = row.get("COD_RELA_ASSUJ", "").strip() or filename
+                if src_neq:
+                    source_node_id = normalize_node_id(COMPANY_NODE, src_neq)
+                else:
+                    source_node_id = normalize_company_label_node_id(src_name)
                 relation_key = (
-                    normalize_node_id(COMPANY_NODE, src_neq),
+                    source_node_id,
                     normalize_node_id(COMPANY_NODE, dst_neq),
                     f"company_relation:{relation_code}",
                     filename,
@@ -978,6 +1062,31 @@ def ingest_archive(zip_path: Path) -> Dict[str, int]:
                         "source": REQ_OPEN_DATA_SOURCE,
                     }
                 )
+            if len(alias_batch) >= RELATION_BATCH_SIZE:
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO entity_aliases (node_id, alias, normalized_alias, source)
+                        VALUES (:node_id, :alias, :normalized_alias, :source)
+                        ON CONFLICT(node_id, normalized_alias) DO NOTHING
+                        """
+                    ),
+                    alias_batch,
+                )
+                inserted_aliases += len(alias_batch)
+                alias_batch.clear()
+                conn.commit()
+                logger.info("REQ ingest inserted_aliases=%s", inserted_aliases)
+
+        for node_id, label in named_companies.items():
+            alias_batch.append(
+                {
+                    "node_id": node_id,
+                    "alias": label,
+                    "normalized_alias": normalize_text(label),
+                    "source": REQ_OPEN_DATA_SOURCE,
+                }
+            )
             if len(alias_batch) >= RELATION_BATCH_SIZE:
                 conn.execute(
                     text(
