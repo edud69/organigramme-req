@@ -7,6 +7,7 @@ Application Flask pour rechercher les entreprises du Québec et visualiser leurs
 - Télécharge automatiquement la dernière archive ZIP du REQ depuis Données Québec.
 - Indexe les CSV dans une base persistante via `DATABASE_URL` quand elle est disponible.
 - Affiche un graphe visuel des relations directes entre entités juridiques trouvées dans les fichiers REQ.
+- Peut enrichir progressivement certaines entreprises à partir de la consultation publique officielle pour récupérer administrateurs, dirigeants, actionnaires et bénéficiaires ultimes.
 - Expose un endpoint de sync manuel `POST /api/sync`.
 - Lance un sync automatique toutes les 24 heures tant que le service reste actif.
 
@@ -18,6 +19,23 @@ Le jeu de données ouvert du REQ anonymise les personnes physiques et les person
 - les noms, prénoms et adresses des personnes liées comme les administrateurs sont absents.
 
 Conséquence : l’application prépare déjà le modèle de données pour relier des personnes physiques aux compagnies, mais ces nœuds ne peuvent pas être remplis à grande échelle à partir du seul dataset ouvert. Pour afficher actionnaires, administrateurs et bénéficiaires ultimes, il faut une source complémentaire autorisée.
+
+## Enrichissement public incrémental
+
+Le projet sait maintenant tenter un enrichissement supplémentaire via la consultation publique officielle du registre.
+
+Principe :
+
+- le ZIP REQ reste la source de base pour toutes les entreprises;
+- une seconde passe visite un nombre limité de fiches publiques;
+- les personnes physiques extraites sont ajoutées comme nœuds `person`;
+- les liens `administrateur`, `dirigeant`, `actionnaire` et `bénéficiaire ultime` sont ajoutés quand ils sont détectés.
+
+Limite importante :
+
+- le site officiel est protégé par Cloudflare;
+- l’enrichissement automatique peut demander une vérification humaine ponctuelle dans Chrome;
+- il faut donc traiter cet enrichissement comme un processus incrémental et opportuniste, pas comme une garantie de couverture complète de tout le Québec chaque nuit.
 
 ## Lancer le projet
 
@@ -59,6 +77,11 @@ Par défaut, `POST /api/sync` lance le sync en arrière-plan et répond tout de 
 - `REQ_CKAN_PACKAGE_URL` : surcharge de l'URL CKAN si nécessaire
 - `REQ_DATASET_ZIP_URL` : URL ZIP directe à utiliser si l'API CKAN renvoie `403`
 - `REQ_DATA_DIR` : dossier local temporaire pour l'archive ZIP, par défaut `/tmp/organigramme-req` quand `DATABASE_URL` est défini
+- `REQ_PUBLIC_ENRICH_ENABLED` : `1` pour activer l’enrichissement depuis le registre public
+- `REQ_PUBLIC_ENRICH_LIMIT` : nombre de fiches publiques à enrichir par sync, par défaut `25`
+- `REQ_PUBLIC_HEADLESS` : `0` recommandé pour pouvoir résoudre un défi Cloudflare si nécessaire
+- `REQ_PUBLIC_BROWSER_CHANNEL` : canal navigateur Playwright pour l’enrichissement public, par défaut `chrome`
+- `REQ_PUBLIC_CHALLENGE_TIMEOUT_SECONDS` : temps d’attente d’une éventuelle vérification Cloudflare avant échec
 
 ## Déploiement
 
@@ -78,6 +101,21 @@ Le repo inclut :
 6. Utiliser GitHub Actions pour exécuter `python app.py sync` chaque nuit directement vers Postgres.
 
 Cette approche est robuste pour le refresh du dataset ouvert. Pour les personnes physiques, il faudra décider de la source d’enrichissement avant de promettre un graphe complet entreprise/personne à l’échelle du Québec.
+
+Pour activer l’enrichissement public incrémental sur ton Mac, ajoute par exemple :
+
+```bash
+REQ_PUBLIC_ENRICH_ENABLED=1
+REQ_PUBLIC_ENRICH_LIMIT=10
+REQ_PUBLIC_HEADLESS=0
+```
+
+Recommandation pratique :
+
+- commence avec une petite limite, par exemple `5` ou `10`;
+- laisse Chrome visible;
+- si une page Cloudflare apparaît, résous-la une fois dans le navigateur;
+- les syncs suivants réutiliseront le profil navigateur persistant.
 
 ## GitHub Actions
 
@@ -157,3 +195,4 @@ Notes :
 - si Chrome n'est pas installé, tu peux utiliser Chromium via `python -m playwright install chromium` et vider `REQ_BROWSER_CHANNEL`.
 - tu peux utiliser le pooler Supabase dans `DATABASE_URL` et aussi dans `SYNC_DATABASE_URL`.
 - si la connexion directe Supabase fonctionne sur ta machine, tu peux aussi l'utiliser pour `SYNC_DATABASE_URL`, mais ce n'est pas obligatoire.
+- pour l’enrichissement public, `REQ_PUBLIC_HEADLESS=0` est fortement recommandé.

@@ -59,7 +59,7 @@ class ReqAppTestCase(unittest.TestCase):
                     ]
                 ),
             )
-        app_module.ingest_tables(app_module.read_archive_tables(app_module.DATA_ZIP_PATH))
+        app_module.ingest_archive(app_module.DATA_ZIP_PATH)
         self.client = app_module.app.test_client()
 
     def tearDown(self):
@@ -86,6 +86,27 @@ class ReqAppTestCase(unittest.TestCase):
         self.assertEqual(payload["companies"], 3)
         self.assertEqual(payload["people"], 0)
         self.assertEqual(payload["relations"], 2)
+
+    def test_parse_public_registry_relations_supports_people_and_companies(self):
+        relations = app_module.parse_public_registry_relations(
+            [
+                {
+                    "heading": "Administrateurs",
+                    "headers": ["Nom", "Fonction"],
+                    "rows": [["Jane Doe", "Présidente"]],
+                },
+                {
+                    "heading": "Actionnaires",
+                    "headers": ["Nom", "NEQ", "Type"],
+                    "rows": [["GESTION ALPHA INC.", "1170000001", "Personne morale"]],
+                },
+            ]
+        )
+        self.assertEqual(len(relations), 2)
+        self.assertEqual(relations[0]["target_type"], app_module.PERSON_NODE)
+        self.assertEqual(relations[0]["relation_label"], "Présidente")
+        self.assertEqual(relations[1]["target_type"], app_module.COMPANY_NODE)
+        self.assertEqual(relations[1]["target_neq"], "1170000001")
 
 
 if __name__ == "__main__":

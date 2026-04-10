@@ -40,6 +40,18 @@ REQ_BROWSER_PRIME_URL = os.environ.get(
     "REQ_BROWSER_PRIME_URL",
     "https://www.donneesquebec.ca/recherche/dataset/registre-des-entreprises",
 ).strip()
+REQ_PUBLIC_ENRICH_ENABLED = os.environ.get("REQ_PUBLIC_ENRICH_ENABLED", "0") == "1"
+REQ_PUBLIC_ENRICH_LIMIT = int(os.environ.get("REQ_PUBLIC_ENRICH_LIMIT", "25"))
+REQ_PUBLIC_HEADLESS = os.environ.get("REQ_PUBLIC_HEADLESS", "0") == "1"
+REQ_PUBLIC_BROWSER_CHANNEL = os.environ.get("REQ_PUBLIC_BROWSER_CHANNEL", REQ_BROWSER_CHANNEL or "chrome").strip() or None
+REQ_PUBLIC_SEARCH_URL = os.environ.get(
+    "REQ_PUBLIC_SEARCH_URL",
+    "https://www.registreentreprises.gouv.qc.ca/REQNA/GR/GR03/GR03A71.RechercheRegistre.MVC/GR03A71",
+).strip()
+REQ_PUBLIC_PROFILE_DIR = Path(
+    os.environ.get("REQ_PUBLIC_PROFILE_DIR", str(DATA_DIR / "public-browser-profile"))
+)
+REQ_PUBLIC_CHALLENGE_TIMEOUT_SECONDS = int(os.environ.get("REQ_PUBLIC_CHALLENGE_TIMEOUT_SECONDS", "45"))
 UPDATE_INTERVAL_SECONDS = int(os.environ.get("UPDATE_INTERVAL_SECONDS", str(24 * 3600)))
 AUTO_SYNC_ENABLED = os.environ.get("AUTO_SYNC_ENABLED", "1") == "1"
 MAX_SEARCH_RESULTS = int(os.environ.get("MAX_SEARCH_RESULTS", "20"))
@@ -56,6 +68,9 @@ RELEVANT_ARCHIVE_FILES = {
     "fusionscissions.csv",
     "continuationstransformations.csv",
 }
+REQ_OPEN_DATA_SOURCE = "req-open-data"
+REQ_PUBLIC_SOURCE = "req-public-registry"
+REQ_PUBLIC_DATASET = "req-public-registry"
 
 app = Flask(__name__)
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
@@ -88,6 +103,18 @@ def utc_now_iso() -> str:
 
 def local_now_iso() -> str:
     return dt.datetime.now().astimezone().isoformat()
+
+
+def parse_iso_datetime(value: Optional[str]) -> Optional[dt.datetime]:
+    if not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.astimezone(dt.timezone.utc)
+    except ValueError:
+        return None
 
 
 def get_database_url() -> str:
@@ -153,6 +180,24 @@ def init_db() -> None:
         conn.execute(
             text(
                 """
+                CREATE TABLE IF NOT EXISTS company_enrichment (
+                    neq TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    last_attempt_at TEXT,
+                    last_success_at TEXT,
+                    next_retry_at TEXT,
+                    last_error TEXT,
+                    profile_url TEXT,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+        )
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_company_enrichment_status_retry ON company_enrichment(status, next_retry_at)"))
+        conn.execute(
+            text(
+                """
                 CREATE TABLE IF NOT EXISTS entities (
                     node_id TEXT PRIMARY KEY,
                     entity_type TEXT NOT NULL,
@@ -213,6 +258,28 @@ def normalize_node_id(entity_type: str, raw_value: str) -> str:
         return f"company:{raw_value.strip()}"
     digest = hashlib.sha1(normalize_text(raw_value).encode("utf-8")).hexdigest()[:16]
     return f"{entity_type}:{digest}"
+
+
+def looks_like_company(label: str) -> bool:
+    value = normalize_text(label)
+    company_markers = (
+        " inc",
+        " ltée",
+        " ltee",
+        " corp",
+        " corporation",
+        " s.e.n.c",
+        " senc",
+        " s.a.",
+        " société",
+        " compagnie",
+        " company",
+        " llc",
+        " ltd",
+        " lp",
+        " s.e.c",
+    )
+    return any(marker in value for marker in company_markers)
 
 
 def fetch_json(url: str, timeout: int = 30) -> Optional[dict]:
@@ -474,6 +541,125 @@ def dedupe_search_rows(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
     return results
 
 
+def get_metadata_value(key: str) -> Optional[str]:
+    with open_db() as conn:
+        row = conn.execute(
+            text("SELECT value FROM metadata WHERE key = :key"),
+            {"key": key},
+        ).mappings().first()
+    return row["value"] if row else None
+
+
+def set_metadata_value(key: str, value: str) -> None:
+    with open_db_tx() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO metadata (key, value)
+                VALUES (:key, :value)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """
+            ),
+            {"key": key, "value": value},
+        )
+
+
+def get_company_entity(conn: Connection, neq: str) -> Optional[Dict[str, str]]:
+    return conn.execute(
+        text("SELECT * FROM entities WHERE node_id = :node_id"),
+        {"node_id": normalize_node_id(COMPANY_NODE, neq)},
+    ).mappings().first()
+
+
+def ensure_company_entity(conn: Connection, neq: str, label: str, source: str = REQ_PUBLIC_SOURCE) -> str:
+    existing = get_company_entity(conn, neq)
+    if existing:
+        return existing["node_id"]
+    node_id = normalize_node_id(COMPANY_NODE, neq)
+    normalized_label = normalize_text(label or neq)
+    conn.execute(
+        text(
+            """
+            INSERT INTO entities (node_id, entity_type, label, normalized_label, neq, source, updated_at)
+            VALUES (:node_id, :entity_type, :label, :normalized_label, :neq, :source, :updated_at)
+            ON CONFLICT(node_id) DO NOTHING
+            """
+        ),
+        {
+            "node_id": node_id,
+            "entity_type": COMPANY_NODE,
+            "label": label or neq,
+            "normalized_label": normalized_label,
+            "neq": neq,
+            "source": source,
+            "updated_at": utc_now_iso(),
+        },
+    )
+    conn.execute(
+        text(
+            """
+            INSERT INTO entity_aliases (node_id, alias, normalized_alias, source)
+            VALUES (:node_id, :alias, :normalized_alias, :source)
+            ON CONFLICT(node_id, normalized_alias) DO NOTHING
+            """
+        ),
+        {
+            "node_id": node_id,
+            "alias": label or neq,
+            "normalized_alias": normalized_label,
+            "source": source,
+        },
+    )
+    return node_id
+
+
+def upsert_company_enrichment_status(
+    conn: Connection,
+    neq: str,
+    status: str,
+    last_error: Optional[str] = None,
+    profile_url: Optional[str] = None,
+    success: bool = False,
+    retry_after_hours: int = 24,
+) -> None:
+    now = utc_now_iso()
+    next_retry_at = None
+    last_success_at = None
+    if success:
+        last_success_at = now
+    else:
+        next_retry_at = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=retry_after_hours)).isoformat()
+    conn.execute(
+        text(
+            """
+            INSERT INTO company_enrichment
+            (neq, status, attempt_count, last_attempt_at, last_success_at, next_retry_at, last_error, profile_url, updated_at)
+            VALUES
+            (:neq, :status, 1, :last_attempt_at, :last_success_at, :next_retry_at, :last_error, :profile_url, :updated_at)
+            ON CONFLICT(neq) DO UPDATE SET
+                status = excluded.status,
+                attempt_count = company_enrichment.attempt_count + 1,
+                last_attempt_at = excluded.last_attempt_at,
+                last_success_at = COALESCE(excluded.last_success_at, company_enrichment.last_success_at),
+                next_retry_at = excluded.next_retry_at,
+                last_error = excluded.last_error,
+                profile_url = COALESCE(excluded.profile_url, company_enrichment.profile_url),
+                updated_at = excluded.updated_at
+            """
+        ),
+        {
+            "neq": neq,
+            "status": status,
+            "last_attempt_at": now,
+            "last_success_at": last_success_at,
+            "next_retry_at": next_retry_at,
+            "last_error": last_error,
+            "profile_url": profile_url,
+            "updated_at": now,
+        },
+    )
+
+
 def upsert_company(
     conn: Connection,
     neq: str,
@@ -642,12 +828,20 @@ def ingest_archive(zip_path: Path) -> Dict[str, int]:
     stats["tables"] = len(seen_files)
     logger.info("REQ ingest company_names=%s", len(company_names))
     with open_db() as conn:
-        if is_postgres():
-            conn.execute(text("TRUNCATE TABLE relations, entity_aliases, entities"))
-        else:
-            conn.execute(text("DELETE FROM relations"))
-            conn.execute(text("DELETE FROM entity_aliases"))
-            conn.execute(text("DELETE FROM entities"))
+        conn.execute(
+            text("DELETE FROM relations WHERE source_dataset IN :datasets").bindparams(
+                bindparam("datasets", expanding=True)
+            ),
+            {"datasets": list(RELEVANT_ARCHIVE_FILES - {"nom.csv"})},
+        )
+        conn.execute(
+            text("DELETE FROM entity_aliases WHERE source = :source"),
+            {"source": REQ_OPEN_DATA_SOURCE},
+        )
+        conn.execute(
+            text("DELETE FROM entities WHERE entity_type = :entity_type AND source = :source"),
+            {"entity_type": COMPANY_NODE, "source": REQ_OPEN_DATA_SOURCE},
+        )
         conn.commit()
 
         entity_batch: List[dict] = []
@@ -663,7 +857,7 @@ def ingest_archive(zip_path: Path) -> Dict[str, int]:
                     "label": label,
                     "normalized_label": normalize_text(label),
                     "neq": neq,
-                    "source": "req-open-data",
+                    "source": REQ_OPEN_DATA_SOURCE,
                     "updated_at": now,
                 }
             )
@@ -701,9 +895,9 @@ def ingest_archive(zip_path: Path) -> Dict[str, int]:
         relation_batch: List[dict] = []
         relation_keys = set()
         inserted_relations = 0
-        for filename, row in iter_archive_rows(zip_path, RELEVANT_ARCHIVE_FILES - {"nom.csv"}):
+        for filename, row in iter_archive_rows(zip_path):
             seen_files.add(filename)
-            if row.get("NEQ", "").strip() and row.get("NEQ_ASSUJ_REL", "").strip():
+            if "NEQ" in row and "NEQ_ASSUJ_REL" in row and row.get("NEQ", "").strip() and row.get("NEQ_ASSUJ_REL", "").strip():
                 relation_files.add(filename)
                 src_neq = row.get("NEQ_ASSUJ_REL", "").strip()
                 dst_neq = row.get("NEQ", "").strip()
@@ -781,7 +975,7 @@ def ingest_archive(zip_path: Path) -> Dict[str, int]:
                         "node_id": node_id,
                         "alias": alias,
                         "normalized_alias": normalized_alias,
-                        "source": "req-open-data",
+                        "source": REQ_OPEN_DATA_SOURCE,
                     }
                 )
             if len(alias_batch) >= RELATION_BATCH_SIZE:
@@ -849,6 +1043,306 @@ def ingest_archive(zip_path: Path) -> Dict[str, int]:
     return stats
 
 
+def candidate_enrichment_neqs(limit: int) -> List[str]:
+    now = utc_now_iso()
+    with open_db() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT e.neq
+                FROM entities e
+                LEFT JOIN company_enrichment ce ON ce.neq = e.neq
+                WHERE e.entity_type = :entity_type
+                  AND e.neq IS NOT NULL
+                  AND (
+                      ce.neq IS NULL
+                      OR ce.next_retry_at IS NULL
+                      OR ce.next_retry_at <= :now_iso
+                  )
+                ORDER BY
+                    COALESCE(ce.last_success_at, '') ASC,
+                    e.neq ASC
+                LIMIT :limit
+                """
+            ),
+            {
+                "entity_type": COMPANY_NODE,
+                "now_iso": now,
+                "limit": limit,
+            },
+        ).mappings().all()
+    return [row["neq"] for row in rows if row["neq"]]
+
+
+def wait_for_registry_page_ready(page) -> None:
+    deadline = time.time() + REQ_PUBLIC_CHALLENGE_TIMEOUT_SECONDS
+    while True:
+        title = (page.title() or "").strip()
+        body_text = (page.locator("body").inner_text(timeout=5000) or "")[:2000]
+        challenge = "just a moment" in title.lower() or "verifying you are human" in body_text.lower()
+        if not challenge:
+            return
+        if time.time() >= deadline:
+            raise RuntimeError(
+                "Le registre public REQ demande une vérification Cloudflare. "
+                "Relance avec REQ_PUBLIC_HEADLESS=0 et résous le défi une fois dans le navigateur."
+            )
+        page.wait_for_timeout(1000)
+
+
+def extract_registry_tables(page) -> List[Dict[str, object]]:
+    return page.evaluate(
+        """
+        () => {
+          function normalize(text) {
+            return (text || '').replace(/\\s+/g, ' ').trim();
+          }
+          function previousHeading(table) {
+            let node = table.previousElementSibling;
+            while (node) {
+              const tag = (node.tagName || '').toLowerCase();
+              const text = normalize(node.innerText);
+              if (text && ['h1','h2','h3','h4','legend','caption','strong'].includes(tag)) {
+                return text;
+              }
+              node = node.previousElementSibling;
+            }
+            return '';
+          }
+          return Array.from(document.querySelectorAll('table')).map((table) => {
+            const headers = Array.from(table.querySelectorAll('th')).map((th) => normalize(th.innerText));
+            const rows = Array.from(table.querySelectorAll('tr'))
+              .map((tr) => Array.from(tr.querySelectorAll('td')).map((td) => normalize(td.innerText)))
+              .filter((row) => row.length);
+            return {
+              heading: previousHeading(table),
+              headers,
+              rows,
+            };
+          }).filter((table) => table.rows.length);
+        }
+        """
+    )
+
+
+def classify_public_heading(heading: str) -> Optional[str]:
+    normalized = normalize_text(heading)
+    if "administrateur" in normalized:
+        return "administrateur"
+    if "dirigeant" in normalized:
+        return "dirigeant"
+    if "actionnaire" in normalized:
+        return "actionnaire"
+    if "bénéficiaire ultime" in normalized or "beneficiaire ultime" in normalized:
+        return "beneficiaire_ultime"
+    if "associ" in normalized:
+        return "associe"
+    return None
+
+
+def extract_name_from_row(row_values: List[str], headers: List[str]) -> str:
+    normalized_headers = [normalize_text(header) for header in headers]
+    preferred_indexes = [
+        index
+        for index, header in enumerate(normalized_headers)
+        if "nom" in header and "entreprise" not in header and "localit" not in header
+    ]
+    for index in preferred_indexes:
+        if index < len(row_values) and row_values[index].strip():
+            return row_values[index].strip()
+    for value in row_values:
+        stripped = value.strip()
+        if stripped and not any(char.isdigit() for char in stripped[:4]):
+            return stripped
+    return ""
+
+
+def extract_related_neq(row_values: List[str], headers: List[str]) -> str:
+    normalized_headers = [normalize_text(header) for header in headers]
+    for index, header in enumerate(normalized_headers):
+        if "neq" in header and index < len(row_values):
+            candidate = "".join(ch for ch in row_values[index] if ch.isdigit())
+            if len(candidate) == 10:
+                return candidate
+    for value in row_values:
+        candidate = "".join(ch for ch in value if ch.isdigit())
+        if len(candidate) == 10:
+            return candidate
+    return ""
+
+
+def extract_role_from_row(row_values: List[str], headers: List[str], fallback: str) -> str:
+    normalized_headers = [normalize_text(header) for header in headers]
+    for index, header in enumerate(normalized_headers):
+        if any(keyword in header for keyword in ("fonction", "qualité", "qualite", "titre", "type")):
+            if index < len(row_values) and row_values[index].strip():
+                return row_values[index].strip()
+    return fallback.replace("_", " ")
+
+
+def parse_public_registry_relations(tables: List[Dict[str, object]]) -> List[Dict[str, str]]:
+    relations = []
+    for table in tables:
+        relation_kind = classify_public_heading(str(table.get("heading", "")))
+        if not relation_kind:
+            continue
+        headers = [str(value) for value in table.get("headers", [])]
+        for raw_row in table.get("rows", []):
+            row_values = [str(value).strip() for value in raw_row]
+            related_neq = extract_related_neq(row_values, headers)
+            related_name = extract_name_from_row(row_values, headers)
+            if not related_neq and not related_name:
+                continue
+            role = extract_role_from_row(row_values, headers, relation_kind)
+            target_type = COMPANY_NODE if related_neq or looks_like_company(related_name) else PERSON_NODE
+            relations.append(
+                {
+                    "target_type": target_type,
+                    "target_name": related_name or related_neq,
+                    "target_neq": related_neq,
+                    "relation_type": f"public_role:{relation_kind}",
+                    "relation_label": role,
+                }
+            )
+    return relations
+
+
+def load_public_registry_profile(context, neq: str) -> Dict[str, object]:
+    page = context.new_page()
+    page.set_default_timeout(max(90000, REQ_PUBLIC_CHALLENGE_TIMEOUT_SECONDS * 1000))
+    try:
+        page.goto(REQ_PUBLIC_SEARCH_URL, wait_until="domcontentloaded")
+        wait_for_registry_page_ready(page)
+        page.locator("#Objet").fill(neq)
+        page.locator("#ConditionUtilisationCochee").check()
+        page.locator("form").get_by_role("button", name="Rechercher").click()
+        wait_for_registry_page_ready(page)
+        page.wait_for_timeout(2000)
+        if page.locator(f"a:has-text('{neq}')").count() > 0:
+            page.locator(f"a:has-text('{neq}')").first.click()
+            wait_for_registry_page_ready(page)
+            page.wait_for_timeout(2000)
+        title = page.title()
+        body_text = page.locator("body").inner_text() or ""
+        if "aucun résultat" in body_text.lower():
+            raise RuntimeError(f"Aucun résultat public pour le NEQ {neq}.")
+        tables = extract_registry_tables(page)
+        relations = parse_public_registry_relations(tables)
+        return {
+            "profile_url": page.url,
+            "title": title,
+            "relations": relations,
+            "raw_text": body_text[:12000],
+        }
+    finally:
+        page.close()
+
+
+def enrich_public_registry(limit: int) -> Dict[str, int]:
+    if limit <= 0:
+        return {"attempted": 0, "succeeded": 0, "people": 0, "company_links": 0}
+
+    ensure_data_dir()
+    REQ_PUBLIC_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    attempted = 0
+    succeeded = 0
+    people = 0
+    company_links = 0
+    neqs = candidate_enrichment_neqs(limit)
+    if not neqs:
+        return {"attempted": 0, "succeeded": 0, "people": 0, "company_links": 0}
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        logger.exception("Playwright public registry enrichment unavailable")
+        return {"attempted": 0, "succeeded": 0, "people": 0, "company_links": 0}
+
+    with sync_playwright() as p:
+        launch_kwargs = {
+            "headless": REQ_PUBLIC_HEADLESS,
+            "accept_downloads": False,
+            "user_agent": HTTP_USER_AGENT,
+        }
+        if REQ_PUBLIC_BROWSER_CHANNEL:
+            launch_kwargs["channel"] = REQ_PUBLIC_BROWSER_CHANNEL
+        context = p.chromium.launch_persistent_context(str(REQ_PUBLIC_PROFILE_DIR), **launch_kwargs)
+        try:
+            for neq in neqs:
+                attempted += 1
+                try:
+                    profile = load_public_registry_profile(context, neq)
+                    inserted_people = 0
+                    inserted_company_links = 0
+                    with open_db_tx() as conn:
+                        conn.execute(
+                            text(
+                                "DELETE FROM relations WHERE source_dataset = :dataset AND source_detail LIKE :prefix"
+                            ),
+                            {
+                                "dataset": REQ_PUBLIC_DATASET,
+                                "prefix": f"{neq}:%",
+                            },
+                        )
+                        source_node_id = ensure_company_entity(conn, neq, neq, REQ_OPEN_DATA_SOURCE)
+                        for relation in profile["relations"]:
+                            if relation["target_type"] == PERSON_NODE:
+                                target_node_id = upsert_person(conn, relation["target_name"], REQ_PUBLIC_SOURCE)
+                                inserted_people += 1
+                            else:
+                                target_node_id = ensure_company_entity(
+                                    conn,
+                                    relation["target_neq"] or relation["target_name"],
+                                    relation["target_name"],
+                                    REQ_PUBLIC_SOURCE,
+                                )
+                                inserted_company_links += 1
+                            insert_relation(
+                                conn,
+                                source_node_id,
+                                target_node_id,
+                                relation["relation_type"],
+                                relation["relation_label"],
+                                REQ_PUBLIC_DATASET,
+                                f"{neq}:{relation['relation_type']}",
+                            )
+                        upsert_company_enrichment_status(
+                            conn,
+                            neq,
+                            "success",
+                            profile_url=profile["profile_url"],
+                            success=True,
+                        )
+                    succeeded += 1
+                    people += inserted_people
+                    company_links += inserted_company_links
+                    logger.info(
+                        "REQ public enrichment neq=%s people=%s company_links=%s",
+                        neq,
+                        inserted_people,
+                        inserted_company_links,
+                    )
+                except Exception as exc:
+                    with open_db_tx() as conn:
+                        upsert_company_enrichment_status(
+                            conn,
+                            neq,
+                            "failed",
+                            last_error=str(exc),
+                            retry_after_hours=24,
+                        )
+                    logger.exception("REQ public enrichment failed for neq=%s", neq)
+        finally:
+            context.close()
+
+    return {
+        "attempted": attempted,
+        "succeeded": succeeded,
+        "people": people,
+        "company_links": company_links,
+    }
+
+
 def sync_dataset(force: bool = False) -> Dict[str, object]:
     with data_lock:
         logger.info("REQ sync started force=%s", force)
@@ -900,11 +1394,16 @@ def sync_dataset(force: bool = False) -> Dict[str, object]:
 
             sync_state["phase"] = "ingesting"
             stats = ingest_archive(DATA_ZIP_PATH)
+            public_enrichment = None
+            if REQ_PUBLIC_ENRICH_ENABLED:
+                sync_state["phase"] = "enriching_public_registry"
+                public_enrichment = enrich_public_registry(REQ_PUBLIC_ENRICH_LIMIT)
             search_entities.cache_clear()
             result = {
                 "downloaded": should_download,
                 "remote_last_modified": zip_resource.get("last_modified"),
                 "stats": stats,
+                "public_enrichment": public_enrichment,
                 "source_note": (
                     "Le jeu de données ouvert du REQ exclut les noms et prénoms des personnes physiques. "
                     "Le graphe des personnes est donc prêt pour de l'enrichissement, mais restera vide "
@@ -947,15 +1446,6 @@ def start_sync_in_background(force: bool = False) -> bool:
     return True
 
 
-def get_metadata_value(key: str) -> Optional[str]:
-    with open_db() as conn:
-        row = conn.execute(
-            text("SELECT value FROM metadata WHERE key = :key"),
-            {"key": key},
-        ).mappings().first()
-    return row["value"] if row else None
-
-
 def get_summary() -> Dict[str, object]:
     with open_db() as conn:
         company_total = conn.execute(
@@ -967,16 +1457,19 @@ def get_summary() -> Dict[str, object]:
             {"entity_type": PERSON_NODE},
         ).mappings().one()["total"]
         relation_total = conn.execute(text("SELECT COUNT(*) AS total FROM relations")).mappings().one()["total"]
+        enrichment_total = conn.execute(text("SELECT COUNT(*) AS total FROM company_enrichment WHERE status = 'success'")).mappings().one()["total"]
 
     return {
         "companies": company_total,
         "people": person_total,
         "relations": relation_total,
+        "public_profiles": enrichment_total,
         "last_ingest_at": get_metadata_value("last_ingest_at"),
         "sync": dict(sync_state),
         "constraints": [
             "Les données ouvertes REQ couvrent toutes les entreprises, mais anonymisent les personnes physiques.",
             "Les liens vers actionnaires, administrateurs et bénéficiaires ultimes exigent une source complémentaire autorisée.",
+            "L'enrichissement public repose sur le registre officiel et peut nécessiter une vérification Cloudflare dans Chrome.",
         ],
     }
 
