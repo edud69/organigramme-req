@@ -96,7 +96,15 @@ def get_database_url() -> str:
 def get_engine() -> Engine:
     global db_engine
     if db_engine is None:
-        db_engine = create_engine(get_database_url(), pool_pre_ping=True, future=True)
+        engine_kwargs = {
+            "pool_pre_ping": True,
+            "future": True,
+        }
+        if DATABASE_URL:
+            engine_kwargs["connect_args"] = {
+                "options": "-c statement_timeout=0 -c lock_timeout=0"
+            }
+        db_engine = create_engine(get_database_url(), **engine_kwargs)
     return db_engine
 
 
@@ -312,7 +320,12 @@ def download_file_with_browser(url: str, dest: Path) -> bool:
 
                 logger.info("REQ browser downloading archive from %s", url)
                 with page.expect_download(timeout=SYNC_TIMEOUT_SECONDS * 1000) as download_info:
-                    page.goto(url, wait_until="domcontentloaded")
+                    try:
+                        page.goto(url, wait_until="domcontentloaded")
+                    except Exception as exc:
+                        # Playwright raises when navigation turns into a file download.
+                        if "Download is starting" not in str(exc):
+                            raise
 
                 download = download_info.value
                 logger.info("REQ browser download suggested filename=%s", download.suggested_filename)
@@ -358,7 +371,13 @@ def read_archive_tables(zip_path: Path) -> Dict[str, List[Dict[str, str]]]:
                 continue
             reader = csv.DictReader(io.StringIO(text))
             basename = Path(filename).name.lower()
-            tables[basename] = [{(key or "").strip(): (value or "").strip() for key, value in row.items()} for row in reader]
+            tables[basename] = [
+                {
+                    (key or "").replace("\ufeff", "").strip(): (value or "").strip()
+                    for key, value in row.items()
+                }
+                for row in reader
+            ]
     return tables
 
 
@@ -545,10 +564,13 @@ def ingest_tables(tables: Dict[str, List[Dict[str, str]]]) -> Dict[str, int]:
                     label = choose_company_name(row) or neq
                     company_names.setdefault(neq, set()).update(aliases or {label})
 
+        logger.info("REQ ingest company_names=%s", len(company_names))
+
         for neq, aliases in company_names.items():
             upsert_company(conn, neq, sorted(aliases)[0], "req-open-data", aliases=aliases)
 
         relation_files = 0
+        direct_relations = 0
         for filename, rows in tables.items():
             if not rows:
                 continue
@@ -562,6 +584,7 @@ def ingest_tables(tables: Dict[str, List[Dict[str, str]]]) -> Dict[str, int]:
                     dst_neq = row.get("NEQ", "").strip()
                     if not src_neq or not dst_neq:
                         continue
+                    direct_relations += 1
                     src_name = company_names.get(src_neq, {src_neq})
                     dst_name = company_names.get(dst_neq, {dst_neq})
                     src_node_id = upsert_company(conn, src_neq, sorted(src_name)[0], "req-open-data", aliases=src_name)
@@ -597,6 +620,8 @@ def ingest_tables(tables: Dict[str, List[Dict[str, str]]]) -> Dict[str, int]:
                         role,
                         filename,
                     )
+
+        logger.info("REQ ingest relation_files=%s direct_relations=%s", relation_files, direct_relations)
 
         stats["companies"] = conn.execute(
             text("SELECT COUNT(*) AS total FROM entities WHERE entity_type = :entity_type"),
