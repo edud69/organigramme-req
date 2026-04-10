@@ -18,6 +18,9 @@
       --company: #0d7c66;
       --person: #c65b37;
       --link: rgba(8, 48, 42, 0.28);
+      --link-fusion: #b85c38;
+      --link-continuation: #185abd;
+      --link-other: #667a74;
       --warning: #8f5f00;
     }
 
@@ -223,6 +226,43 @@
       background: var(--person);
     }
 
+    .swatch {
+      width: 20px;
+      height: 4px;
+      border-radius: 999px;
+      display: inline-block;
+    }
+
+    .swatch.fusion {
+      background: var(--link-fusion);
+    }
+
+    .swatch.continuation {
+      background: var(--link-continuation);
+    }
+
+    .swatch.other {
+      background: var(--link-other);
+    }
+
+    .graph-meta {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      padding: 0 24px 14px;
+    }
+
+    .graph-meta .panel {
+      padding: 14px 16px;
+      border-radius: 16px;
+    }
+
+    .graph-meta strong {
+      display: block;
+      font-size: 18px;
+      margin-bottom: 4px;
+    }
+
     .tooltip {
       position: absolute;
       pointer-events: none;
@@ -317,9 +357,26 @@
         <div class="legend">
           <span><i class="dot company"></i> Compagnie</span>
           <span><i class="dot person"></i> Personne physique</span>
+          <span><i class="swatch fusion"></i> Fusion / scission</span>
+          <span><i class="swatch continuation"></i> Continuation</span>
+          <span><i class="swatch other"></i> Autres liens</span>
         </div>
       </div>
       <p class="stage-note">Le graphe affiche les relations directes disponibles dans la base locale. Les libellés dépendent des fichiers REQ présents dans l’archive.</p>
+      <section class="graph-meta">
+        <div class="panel">
+          <strong id="graph-nodes-count">0</strong>
+          <span class="meta">nœuds affichés</span>
+        </div>
+        <div class="panel">
+          <strong id="graph-links-count">0</strong>
+          <span class="meta">liens affichés</span>
+        </div>
+        <div class="panel">
+          <strong id="graph-focus-kind">Aucun</strong>
+          <span class="meta">type de réseau</span>
+        </div>
+      </section>
       <div id="graph">
         <div id="empty-state" class="empty">
           <div>
@@ -340,6 +397,9 @@
       const emptyState = document.getElementById('empty-state');
       const tooltip = document.getElementById('tooltip');
       const selectionTitle = document.getElementById('selection-title');
+      const graphNodesCount = document.getElementById('graph-nodes-count');
+      const graphLinksCount = document.getElementById('graph-links-count');
+      const graphFocusKind = document.getElementById('graph-focus-kind');
       let timeoutId = null;
 
       function formatType(type) {
@@ -360,6 +420,34 @@
           li.appendChild(button);
           searchResults.appendChild(li);
         });
+      }
+
+      function classifyLink(link) {
+        const type = (link.type || '').toLowerCase();
+        const label = (link.label || '').toLowerCase();
+        if (type.includes('fusion') || label.includes('fusion') || label.includes('scission')) {
+          return 'fusion';
+        }
+        if (type.includes('continuation') || label.includes('continuation') || label.includes('transformation')) {
+          return 'continuation';
+        }
+        return 'other';
+      }
+
+      function describeGraph(data) {
+        graphNodesCount.textContent = String(data.nodes.length);
+        graphLinksCount.textContent = String(data.links.length);
+        const kinds = new Set(data.links.map(classifyLink));
+        if (!data.links.length) {
+          graphFocusKind.textContent = 'Aucun lien';
+        } else if (kinds.size === 1) {
+          graphFocusKind.textContent =
+            kinds.has('fusion') ? 'Fusions / scissions' :
+            kinds.has('continuation') ? 'Continuations' :
+            'Liens corporatifs';
+        } else {
+          graphFocusKind.textContent = 'Réseau mixte';
+        }
       }
 
       async function refreshSummary() {
@@ -400,6 +488,7 @@
         const height = graphEl.clientHeight;
         graphEl.querySelectorAll('svg').forEach((node) => node.remove());
         emptyState.style.display = data.nodes.length ? 'none' : 'grid';
+        describeGraph(data);
         if (!data.nodes.length) {
           return;
         }
@@ -409,13 +498,55 @@
           .attr('width', width)
           .attr('height', height);
 
+        const defs = svg.append('defs');
+        defs.append('marker')
+          .attr('id', 'arrow-fusion')
+          .attr('viewBox', '0 -5 10 10')
+          .attr('refX', 16)
+          .attr('refY', 0)
+          .attr('markerWidth', 8)
+          .attr('markerHeight', 8)
+          .attr('orient', 'auto')
+          .append('path')
+          .attr('fill', 'var(--link-fusion)')
+          .attr('d', 'M0,-5L10,0L0,5');
+
+        defs.append('marker')
+          .attr('id', 'arrow-continuation')
+          .attr('viewBox', '0 -5 10 10')
+          .attr('refX', 16)
+          .attr('refY', 0)
+          .attr('markerWidth', 8)
+          .attr('markerHeight', 8)
+          .attr('orient', 'auto')
+          .append('path')
+          .attr('fill', 'var(--link-continuation)')
+          .attr('d', 'M0,-5L10,0L0,5');
+
+        defs.append('marker')
+          .attr('id', 'arrow-other')
+          .attr('viewBox', '0 -5 10 10')
+          .attr('refX', 16)
+          .attr('refY', 0)
+          .attr('markerWidth', 8)
+          .attr('markerHeight', 8)
+          .attr('orient', 'auto')
+          .append('path')
+          .attr('fill', 'var(--link-other)')
+          .attr('d', 'M0,-5L10,0L0,5');
+
         svg.append('g')
           .selectAll('line')
           .data(data.links)
           .enter()
           .append('line')
-          .attr('stroke', 'var(--link)')
-          .attr('stroke-width', 1.6);
+          .attr('stroke', (d) => {
+            const kind = classifyLink(d);
+            return kind === 'fusion' ? 'var(--link-fusion)' : kind === 'continuation' ? 'var(--link-continuation)' : 'var(--link-other)';
+          })
+          .attr('stroke-width', (d) => classifyLink(d) === 'fusion' ? 2.8 : 2)
+          .attr('stroke-dasharray', (d) => classifyLink(d) === 'continuation' ? '8 6' : null)
+          .attr('marker-end', (d) => `url(#arrow-${classifyLink(d)})`);
 
         const linkLabels = svg.append('g')
           .selectAll('text')
@@ -423,7 +554,8 @@
           .enter()
           .append('text')
           .attr('font-size', 11)
-          .attr('fill', '#4b5d58')
+          .attr('font-weight', 700)
+          .attr('fill', (d) => classifyLink(d) === 'fusion' ? 'var(--link-fusion)' : classifyLink(d) === 'continuation' ? 'var(--link-continuation)' : '#4b5d58')
           .attr('text-anchor', 'middle')
           .text((d) => d.label || '');
 
@@ -467,6 +599,22 @@
           tooltip.style.opacity = '0';
           tooltip.style.transform = 'translateY(4px)';
         });
+
+        svg.selectAll('line')
+          .on('mouseenter', (event, d) => {
+            tooltip.style.opacity = '1';
+            tooltip.style.transform = 'translateY(0)';
+            tooltip.innerHTML = `
+              <strong>${d.label || 'Lien'}</strong><br>
+              ${d.dataset ? `Source: ${d.dataset}` : 'Source inconnue'}
+            `;
+            tooltip.style.left = `${event.pageX + 12}px`;
+            tooltip.style.top = `${event.pageY - 20}px`;
+          })
+          .on('mouseleave', () => {
+            tooltip.style.opacity = '0';
+            tooltip.style.transform = 'translateY(4px)';
+          });
 
         const simulation = d3.forceSimulation(data.nodes)
           .force('link', d3.forceLink(data.links).id((d) => d.id).distance(150))
