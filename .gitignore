@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 data/*.sqlite3
 data/*.zip
+.env.local
+logs/

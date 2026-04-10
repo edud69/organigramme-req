@@ -87,3 +87,53 @@ Secrets GitHub à définir :
 
 - `DATABASE_URL` : chaîne Postgres Supabase ou autre base persistante
 - `REQ_DATASET_ZIP_URL` : URL directe du ZIP REQ
+
+## Automatisation locale macOS
+
+Quand le REQ bloque les téléchargements depuis des IP cloud, la solution la plus fiable est d'exécuter le sync chaque nuit depuis ton Mac, puis d'écrire dans Supabase.
+
+Fichiers fournis :
+
+- script : [scripts/run_req_sync.sh](/Users/matt/Documents/Codex/organigramme-req/scripts/run_req_sync.sh)
+- exemple d'environnement : [.env.local.example](/Users/matt/Documents/Codex/organigramme-req/.env.local.example)
+- job `launchd` : [launchd/com.organigramme.req-sync.plist](/Users/matt/Documents/Codex/organigramme-req/launchd/com.organigramme.req-sync.plist)
+
+Étapes :
+
+1. Créer `.env.local` à la racine du projet à partir de `.env.local.example`.
+2. Y mettre au minimum :
+   - `DATABASE_URL`
+   - `REQ_DATASET_ZIP_URL`
+3. Rendre le script exécutable :
+
+```bash
+chmod +x /Users/matt/Documents/Codex/organigramme-req/scripts/run_req_sync.sh
+```
+
+4. Créer le dossier de logs :
+
+```bash
+mkdir -p /Users/matt/Documents/Codex/organigramme-req/logs
+```
+
+5. Installer le job `launchd` :
+
+```bash
+cp /Users/matt/Documents/Codex/organigramme-req/launchd/com.organigramme.req-sync.plist ~/Library/LaunchAgents/
+launchctl unload ~/Library/LaunchAgents/com.organigramme.req-sync.plist 2>/dev/null || true
+launchctl load ~/Library/LaunchAgents/com.organigramme.req-sync.plist
+```
+
+6. Lancer un test manuel :
+
+```bash
+launchctl start com.organigramme.req-sync
+```
+
+7. Consulter les logs :
+
+```bash
+tail -f /Users/matt/Documents/Codex/organigramme-req/logs/req-sync.log
+```
+
+Le job est configuré pour tourner tous les jours à `03:15` heure locale. Tu peux changer l'heure dans le fichier plist.
