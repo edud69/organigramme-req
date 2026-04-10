@@ -847,6 +847,7 @@ def ingest_archive(zip_path: Path) -> Dict[str, int]:
     }
     now = utc_now_iso()
     company_names: Dict[str, set] = {}
+    company_alias_index: Dict[str, str] = {}
     named_companies: Dict[str, str] = {}
     seen_files = set()
     for filename, row in iter_archive_rows(zip_path, {"nom.csv"}):
@@ -869,12 +870,19 @@ def ingest_archive(zip_path: Path) -> Dict[str, int]:
         label = choose_company_name(row) or neq
         company_names.setdefault(neq, set()).update(aliases or {label})
 
+    for neq, aliases in company_names.items():
+        node_id = normalize_node_id(COMPANY_NODE, neq)
+        for alias in aliases:
+            normalized_alias = normalize_text(alias)
+            if normalized_alias and normalized_alias not in company_alias_index:
+                company_alias_index[normalized_alias] = node_id
+
     for filename, row in iter_archive_rows(zip_path):
         seen_files.add(filename)
         if "NEQ" in row and "NEQ_ASSUJ_REL" in row:
             related_neq = row.get("NEQ_ASSUJ_REL", "").strip()
             related_name = row.get("DENOMN_SOC", "").strip()
-            if not related_neq and related_name:
+            if not related_neq and related_name and normalize_text(related_name) not in company_alias_index:
                 named_companies[normalize_company_label_node_id(related_name)] = related_name
 
     stats["tables"] = len(seen_files)
@@ -985,6 +993,8 @@ def ingest_archive(zip_path: Path) -> Dict[str, int]:
                 relation_code = row.get("COD_RELA_ASSUJ", "").strip() or filename
                 if src_neq:
                     source_node_id = normalize_node_id(COMPANY_NODE, src_neq)
+                elif src_name and normalize_text(src_name) in company_alias_index:
+                    source_node_id = company_alias_index[normalize_text(src_name)]
                 else:
                     source_node_id = normalize_company_label_node_id(src_name)
                 relation_key = (
