@@ -155,4 +155,5 @@ Notes :
 - `REQ_DOWNLOAD_MODE=browser` force l’usage d’un vrai navigateur piloté par Playwright.
 - `REQ_BROWSER_HEADLESS=0` garde le navigateur visible, ce qui se rapproche davantage d’un usage humain.
 - si Chrome n'est pas installé, tu peux utiliser Chromium via `python -m playwright install chromium` et vider `REQ_BROWSER_CHANNEL`.
-- utilise le pooler Supabase dans `DATABASE_URL` et la connexion directe Supabase dans `SYNC_DATABASE_URL`.
+- tu peux utiliser le pooler Supabase dans `DATABASE_URL` et aussi dans `SYNC_DATABASE_URL`.
+- si la connexion directe Supabase fonctionne sur ta machine, tu peux aussi l'utiliser pour `SYNC_DATABASE_URL`, mais ce n'est pas obligatoire.
