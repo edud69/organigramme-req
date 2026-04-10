@@ -45,9 +45,16 @@ MAX_SEARCH_RESULTS = int(os.environ.get("MAX_SEARCH_RESULTS", "20"))
 MAX_GRAPH_EDGES = int(os.environ.get("MAX_GRAPH_EDGES", "250"))
 SYNC_TIMEOUT_SECONDS = int(os.environ.get("SYNC_TIMEOUT_SECONDS", "120"))
 ADMIN_SYNC_TOKEN = os.environ.get("ADMIN_SYNC_TOKEN", "")
+ENTITY_BATCH_SIZE = int(os.environ.get("ENTITY_BATCH_SIZE", "1000"))
+RELATION_BATCH_SIZE = int(os.environ.get("RELATION_BATCH_SIZE", "2000"))
 
 COMPANY_NODE = "company"
 PERSON_NODE = "person"
+RELEVANT_ARCHIVE_FILES = {
+    "nom.csv",
+    "fusionscissions.csv",
+    "continuationstransformations.csv",
+}
 
 app = Flask(__name__)
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
@@ -130,6 +137,7 @@ def open_db_tx():
 def init_db() -> None:
     entity_aliases_id = "BIGSERIAL PRIMARY KEY" if is_postgres() else "INTEGER PRIMARY KEY AUTOINCREMENT"
     relations_id = "BIGSERIAL PRIMARY KEY" if is_postgres() else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    use_optional_indexes = not is_postgres()
     with open_db_tx() as conn:
         conn.execute(
             text(
@@ -170,7 +178,8 @@ def init_db() -> None:
                 """
             )
         )
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_entity_aliases_normalized ON entity_aliases(normalized_alias)"))
+        if use_optional_indexes:
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_entity_aliases_normalized ON entity_aliases(normalized_alias)"))
         conn.execute(
             text(
                 f"""
@@ -188,8 +197,9 @@ def init_db() -> None:
                 """
             )
         )
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_relations_source ON relations(source_node_id)"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_relations_target ON relations(target_node_id)"))
+        if use_optional_indexes:
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_relations_source ON relations(source_node_id)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_relations_target ON relations(target_node_id)"))
 
 
 def normalize_text(value: str) -> str:
@@ -381,6 +391,37 @@ def read_archive_tables(zip_path: Path) -> Dict[str, List[Dict[str, str]]]:
     return tables
 
 
+def iter_archive_rows(zip_path: Path, target_files: Optional[set[str]] = None):
+    if not zip_path.exists():
+        return
+
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        for filename in archive.namelist():
+            basename = Path(filename).name.lower()
+            if not basename.endswith(".csv"):
+                continue
+            if target_files and basename not in target_files:
+                continue
+            with archive.open(filename) as handle:
+                try:
+                    wrapper = io.TextIOWrapper(handle, encoding="utf-8-sig", newline="")
+                    reader = csv.DictReader(wrapper)
+                    for row in reader:
+                        yield basename, {
+                            (key or "").replace("\ufeff", "").strip(): (value or "").strip()
+                            for key, value in row.items()
+                        }
+                except UnicodeDecodeError:
+                    handle.seek(0)
+                    wrapper = io.TextIOWrapper(handle, encoding="latin-1", newline="")
+                    reader = csv.DictReader(wrapper)
+                    for row in reader:
+                        yield basename, {
+                            (key or "").replace("\ufeff", "").strip(): (value or "").strip()
+                            for key, value in row.items()
+                        }
+
+
 def choose_company_name(row: Dict[str, str]) -> Optional[str]:
     for key in (
         "NOM_ASSUJ",
@@ -453,8 +494,13 @@ def upsert_company(
                 "normalized_alias": normalized_alias,
                 "source": source,
             },
-        )
+    )
     return node_id
+
+
+def chunked(items: List[dict], size: int = 1000) -> Iterable[List[dict]]:
+    for index in range(0, len(items), size):
+        yield items[index : index + size]
 
 
 def upsert_person(conn: Connection, name: str, source: str) -> str:
@@ -530,98 +576,207 @@ def insert_relation(
     )
 
 
-def ingest_tables(tables: Dict[str, List[Dict[str, str]]]) -> Dict[str, int]:
+def ingest_archive(zip_path: Path) -> Dict[str, int]:
     stats = {
-        "tables": len(tables),
+        "tables": 0,
         "companies": 0,
         "people": 0,
         "relations": 0,
     }
-    with open_db_tx() as conn:
-        conn.execute(text("DELETE FROM relations"))
-        conn.execute(text("DELETE FROM entity_aliases"))
-        conn.execute(text("DELETE FROM entities"))
+    now = utc_now_iso()
+    company_names: Dict[str, set] = {}
+    seen_files = set()
+    for filename, row in iter_archive_rows(zip_path, {"nom.csv"}):
+        seen_files.add(filename)
+        neq = row.get("NEQ", "").strip()
+        if not neq:
+            continue
+        aliases = {
+            value.strip()
+            for key, value in row.items()
+            if key
+            in {
+                "NOM_ASSUJ",
+                "DENOMN_SOC",
+                "NOM_ASSUJ_LANG_ETRNG",
+                "NOM_ASSUJ_ETRNG",
+            }
+            and value
+        }
+        label = choose_company_name(row) or neq
+        company_names.setdefault(neq, set()).update(aliases or {label})
 
-        company_names: Dict[str, set] = {}
-        for filename, rows in tables.items():
-            if "nom" in filename:
-                for row in rows:
-                    neq = row.get("NEQ", "").strip()
-                    if not neq:
-                        continue
-                    aliases = {
-                        value.strip()
-                        for key, value in row.items()
-                        if key
-                        in {
-                            "NOM_ASSUJ",
-                            "DENOMN_SOC",
-                            "NOM_ASSUJ_LANG_ETRNG",
-                            "NOM_ASSUJ_ETRNG",
-                        }
-                        and value
-                    }
-                    label = choose_company_name(row) or neq
-                    company_names.setdefault(neq, set()).update(aliases or {label})
+    stats["tables"] = len(seen_files)
+    logger.info("REQ ingest company_names=%s", len(company_names))
+    with open_db() as conn:
+        if is_postgres():
+            conn.execute(text("TRUNCATE TABLE relations, entity_aliases, entities"))
+        else:
+            conn.execute(text("DELETE FROM relations"))
+            conn.execute(text("DELETE FROM entity_aliases"))
+            conn.execute(text("DELETE FROM entities"))
+        conn.commit()
 
-        logger.info("REQ ingest company_names=%s", len(company_names))
-
+        entity_batch: List[dict] = []
+        alias_batch: List[dict] = []
+        inserted_entities = 0
+        inserted_aliases = 0
         for neq, aliases in company_names.items():
-            upsert_company(conn, neq, sorted(aliases)[0], "req-open-data", aliases=aliases)
+            clean_aliases = sorted({alias.strip() for alias in aliases if alias and alias.strip()})
+            label = clean_aliases[0] if clean_aliases else neq
+            node_id = normalize_node_id(COMPANY_NODE, neq)
+            entity_batch.append(
+                {
+                    "node_id": node_id,
+                    "entity_type": COMPANY_NODE,
+                    "label": label,
+                    "normalized_label": normalize_text(label),
+                    "neq": neq,
+                    "source": "req-open-data",
+                    "updated_at": now,
+                }
+            )
+            seen_normalized_aliases = set()
+            for alias in clean_aliases or [label]:
+                normalized_alias = normalize_text(alias)
+                if not normalized_alias or normalized_alias in seen_normalized_aliases:
+                    continue
+                seen_normalized_aliases.add(normalized_alias)
+                alias_batch.append(
+                    {
+                        "node_id": node_id,
+                        "alias": alias,
+                        "normalized_alias": normalized_alias,
+                        "source": "req-open-data",
+                    }
+                )
+            if len(entity_batch) >= ENTITY_BATCH_SIZE:
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO entities (node_id, entity_type, label, normalized_label, neq, source, updated_at)
+                        VALUES (:node_id, :entity_type, :label, :normalized_label, :neq, :source, :updated_at)
+                        """
+                    ),
+                    entity_batch,
+                )
+                inserted_entities += len(entity_batch)
+                entity_batch.clear()
+                conn.commit()
+                logger.info("REQ ingest inserted_entities=%s", inserted_entities)
+            if len(alias_batch) >= RELATION_BATCH_SIZE:
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO entity_aliases (node_id, alias, normalized_alias, source)
+                        VALUES (:node_id, :alias, :normalized_alias, :source)
+                        ON CONFLICT(node_id, normalized_alias) DO NOTHING
+                        """
+                    ),
+                    alias_batch,
+                )
+                inserted_aliases += len(alias_batch)
+                alias_batch.clear()
+                conn.commit()
+                logger.info("REQ ingest inserted_aliases=%s", inserted_aliases)
 
-        relation_files = 0
+        if entity_batch:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO entities (node_id, entity_type, label, normalized_label, neq, source, updated_at)
+                    VALUES (:node_id, :entity_type, :label, :normalized_label, :neq, :source, :updated_at)
+                    """
+                ),
+                entity_batch,
+            )
+            inserted_entities += len(entity_batch)
+        if alias_batch:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO entity_aliases (node_id, alias, normalized_alias, source)
+                    VALUES (:node_id, :alias, :normalized_alias, :source)
+                    ON CONFLICT(node_id, normalized_alias) DO NOTHING
+                    """
+                ),
+                alias_batch,
+            )
+            inserted_aliases += len(alias_batch)
+        conn.commit()
+        logger.info("REQ ingest inserted_entities=%s", inserted_entities)
+        logger.info("REQ ingest inserted_aliases=%s", inserted_aliases)
+
+        relation_files = set()
         direct_relations = 0
-        for filename, rows in tables.items():
-            if not rows:
-                continue
-            sample_keys = {key for key in rows[0].keys() if key}
-
-            if {"NEQ", "NEQ_ASSUJ_REL"}.issubset(sample_keys):
-                relation_files += 1
-                dataset_label = dataset_label_from_filename(filename)
-                for row in rows:
-                    src_neq = row.get("NEQ_ASSUJ_REL", "").strip()
-                    dst_neq = row.get("NEQ", "").strip()
-                    if not src_neq or not dst_neq:
-                        continue
-                    direct_relations += 1
-                    src_name = company_names.get(src_neq, {src_neq})
-                    dst_name = company_names.get(dst_neq, {dst_neq})
-                    src_node_id = upsert_company(conn, src_neq, sorted(src_name)[0], "req-open-data", aliases=src_name)
-                    dst_node_id = upsert_company(conn, dst_neq, sorted(dst_name)[0], "req-open-data", aliases=dst_name)
-                    relation_code = row.get("COD_RELA_ASSUJ", "").strip() or filename
-                    insert_relation(
-                        conn,
-                        src_node_id,
-                        dst_node_id,
-                        f"company_relation:{relation_code}",
-                        dataset_label,
-                        filename,
-                        relation_code,
+        relation_batch: List[dict] = []
+        relation_keys = set()
+        inserted_relations = 0
+        for filename, row in iter_archive_rows(zip_path, RELEVANT_ARCHIVE_FILES - {"nom.csv"}):
+            seen_files.add(filename)
+            if row.get("NEQ", "").strip() and row.get("NEQ_ASSUJ_REL", "").strip():
+                relation_files.add(filename)
+                src_neq = row.get("NEQ_ASSUJ_REL", "").strip()
+                dst_neq = row.get("NEQ", "").strip()
+                direct_relations += 1
+                relation_code = row.get("COD_RELA_ASSUJ", "").strip() or filename
+                relation_key = (
+                    normalize_node_id(COMPANY_NODE, src_neq),
+                    normalize_node_id(COMPANY_NODE, dst_neq),
+                    f"company_relation:{relation_code}",
+                    filename,
+                    relation_code,
+                )
+                if relation_key in relation_keys:
+                    continue
+                relation_keys.add(relation_key)
+                relation_batch.append(
+                    {
+                        "source_node_id": relation_key[0],
+                        "target_node_id": relation_key[1],
+                        "relation_type": relation_key[2],
+                        "relation_label": dataset_label_from_filename(filename),
+                        "source_dataset": filename,
+                        "source_detail": relation_code,
+                        "updated_at": now,
+                    }
+                )
+                if len(relation_batch) >= RELATION_BATCH_SIZE:
+                    conn.execute(
+                        text(
+                            """
+                            INSERT INTO relations
+                            (source_node_id, target_node_id, relation_type, relation_label, source_dataset, source_detail, updated_at)
+                            VALUES (:source_node_id, :target_node_id, :relation_type, :relation_label, :source_dataset, :source_detail, :updated_at)
+                            ON CONFLICT(source_node_id, target_node_id, relation_type, source_dataset, source_detail) DO NOTHING
+                            """
+                        ),
+                        relation_batch,
                     )
+                    inserted_relations += len(relation_batch)
+                    relation_batch.clear()
+                    relation_keys.clear()
+                    conn.commit()
+                    logger.info("REQ ingest inserted_relations=%s", inserted_relations)
 
-            # This supports future enrichment sources where persons are present.
-            if {"NEQ", "NOM_PRENOM"}.issubset(sample_keys):
-                dataset_label = dataset_label_from_filename(filename)
-                for row in rows:
-                    neq = row.get("NEQ", "").strip()
-                    full_name = row.get("NOM_PRENOM", "").strip()
-                    if not neq or not full_name:
-                        continue
-                    company_aliases = company_names.get(neq, {neq})
-                    company_id = upsert_company(conn, neq, sorted(company_aliases)[0], "req-open-data", aliases=company_aliases)
-                    person_id = upsert_person(conn, full_name, "enrichment")
-                    role = row.get("ROLE", "").strip() or row.get("FONCTION", "").strip() or "personne liée"
-                    insert_relation(
-                        conn,
-                        company_id,
-                        person_id,
-                        f"person_role:{normalize_text(role)}",
-                        role,
-                        filename,
-                    )
+        if relation_batch:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO relations
+                    (source_node_id, target_node_id, relation_type, relation_label, source_dataset, source_detail, updated_at)
+                    VALUES (:source_node_id, :target_node_id, :relation_type, :relation_label, :source_dataset, :source_detail, :updated_at)
+                    ON CONFLICT(source_node_id, target_node_id, relation_type, source_dataset, source_detail) DO NOTHING
+                    """
+                ),
+                relation_batch,
+            )
+            inserted_relations += len(relation_batch)
+            conn.commit()
+        logger.info("REQ ingest inserted_relations=%s", inserted_relations)
 
-        logger.info("REQ ingest relation_files=%s direct_relations=%s", relation_files, direct_relations)
+        logger.info("REQ ingest relation_files=%s direct_relations=%s", len(relation_files), direct_relations)
+        stats["tables"] = len(seen_files)
 
         stats["companies"] = conn.execute(
             text("SELECT COUNT(*) AS total FROM entities WHERE entity_type = :entity_type"),
@@ -650,8 +805,9 @@ def ingest_tables(tables: Dict[str, List[Dict[str, str]]]) -> Dict[str, int]:
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """
             ),
-            {"key": "last_table_count", "value": str(relation_files)},
+            {"key": "last_table_count", "value": str(len(relation_files))},
         )
+        conn.commit()
     return stats
 
 
@@ -701,12 +857,11 @@ def sync_dataset(force: bool = False) -> Dict[str, object]:
                     raise RuntimeError("Le téléchargement du jeu de données a échoué.")
 
             sync_state["phase"] = "reading_archive"
-            tables = read_archive_tables(DATA_ZIP_PATH)
-            if not tables:
+            if not DATA_ZIP_PATH.exists():
                 raise RuntimeError("Aucun fichier CSV exploitable n'a été trouvé dans l'archive.")
 
             sync_state["phase"] = "ingesting"
-            stats = ingest_tables(tables)
+            stats = ingest_archive(DATA_ZIP_PATH)
             result = {
                 "downloaded": should_download,
                 "remote_last_modified": zip_resource.get("last_modified"),
@@ -981,7 +1136,7 @@ def bootstrap() -> None:
     init_db()
     if not get_metadata_value("last_ingest_at") and DATA_ZIP_PATH.exists():
         try:
-            ingest_tables(read_archive_tables(DATA_ZIP_PATH))
+            ingest_archive(DATA_ZIP_PATH)
         except Exception:
             pass
     maybe_start_sync_loop()

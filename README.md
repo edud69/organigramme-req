@@ -102,7 +102,8 @@ Fichiers fournis :
 
 1. Créer `.env.local` à la racine du projet à partir de `.env.local.example`.
 2. Y mettre au minimum :
-   - `DATABASE_URL`
+   - `DATABASE_URL` pour l'app web
+   - `SYNC_DATABASE_URL` pour le job local de sync
    - `REQ_DATASET_ZIP_URL`
    - `REQ_DOWNLOAD_MODE=browser`
 3. Installer les dépendances Python et Playwright :
@@ -154,3 +155,4 @@ Notes :
 - `REQ_DOWNLOAD_MODE=browser` force l’usage d’un vrai navigateur piloté par Playwright.
 - `REQ_BROWSER_HEADLESS=0` garde le navigateur visible, ce qui se rapproche davantage d’un usage humain.
 - si Chrome n'est pas installé, tu peux utiliser Chromium via `python -m playwright install chromium` et vider `REQ_BROWSER_CHANNEL`.
+- utilise le pooler Supabase dans `DATABASE_URL` et la connexion directe Supabase dans `SYNC_DATABASE_URL`.

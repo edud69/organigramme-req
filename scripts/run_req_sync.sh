@@ -17,6 +17,10 @@ set -a
 source "$ENV_FILE"
 set +a
 
+if [[ -n "${SYNC_DATABASE_URL:-}" ]]; then
+  export DATABASE_URL="$SYNC_DATABASE_URL"
+fi
+
 export AUTO_SYNC_ENABLED=0
 export FLASK_DEBUG=0
 
